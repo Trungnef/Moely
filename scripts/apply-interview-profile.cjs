@@ -32,6 +32,9 @@ function fail(msg) {
 }
 
 function appIsRunning() {
+    // Electron's single-instance lock is keyed by the userData dir, so this detects the
+    // app however it was started (packaged Natively.exe or `npm start` → electron.exe).
+    if (!app.requestSingleInstanceLock()) return true;
     if (process.platform !== 'win32') return false;
     try {
         const out = execSync('tasklist /FO CSV /NH', { encoding: 'utf8' });

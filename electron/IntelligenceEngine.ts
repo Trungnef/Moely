@@ -120,7 +120,18 @@ export class IntelligenceEngine extends EventEmitter {
     private readonly END_OF_TURN_AFTER_SPEECH_FINAL_MS = 700;
     // Don't auto-answer while the user is already talking (barge-in / answering).
     private readonly USER_SPEAKING_SUPPRESS_MS = 1500;
-    private readonly AUTO_ANSWER_MIN_WORDS = 3;
+    // 2 so that short panel questions ("Why Japan?") still fire; "Thank you." is
+    // filtered by the prompt check, not the length check.
+    private readonly AUTO_ANSWER_MIN_WORDS = 2;
+    // Consecutive interviewer turns closer than this (and with no user speech between)
+    // are treated as one question split by pauses.
+    private turnChain: Array<{ text: string; endedAt: number; answered: boolean }> = [];
+    private turnStartedAt = 0; // first interim/final of the turn being collected
+    private readonly TURN_CHAIN_GAP_MS = 5000;
+    private readonly TURN_CHAIN_MAX = 6;
+    // Extra wait before answering a comment-style prompt (no question signal).
+    private statementTimer: ReturnType<typeof setTimeout> | null = null;
+    private readonly STATEMENT_GRACE_MS = 1500;
     private readonly AUTO_ANSWER_DEDUPE_MS = 20000;
 
     // The what-to-say answer currently streaming into the UI, so a newer generation
@@ -214,7 +225,9 @@ export class IntelligenceEngine extends EventEmitter {
     private static looksLikePrompt(text: string): boolean {
         if (IntelligenceEngine.hasQuestionSignal(text)) return true;
         const words = text.trim().split(/\s+/).filter(Boolean).length;
-        return words >= 8 && /\b(i think|i feel|i believe|it seems|seems|in my opinion|in my view|similar|different|differs|but|however|actually|already|standard|simple|weak|strong)\b/i.test(text);
+        // "your proposal/paper/…" also covers questions whose opener STT misheard
+        // ("What is the main difference…" heard as "This is the main difference…").
+        return words >= 8 && /\b(i think|i feel|i believe|it seems|seems|in my opinion|in my view|similar|different|difference|differs|between|but|however|actually|already|standard|simple|weak|strong|your (proposal|paper|research|plan|method|approach|work|study|results?|controller|experiments?|evaluation|benchmarks?))\b/i.test(text);
     }
 
     private getSetting<T>(key: string, fallback: T): T {
@@ -304,20 +317,70 @@ export class IntelligenceEngine extends EventEmitter {
     }
 
     private completeInterviewerTurn(reason: string): void {
-        const question = this.turnFinals.join(' ').replace(/\s+/g, ' ').trim();
+        const fragment = this.turnFinals.join(' ').replace(/\s+/g, ' ').trim();
         const confidences = this.turnConfidences;
+        const startedAt = this.turnStartedAt || Date.now();
         this.turnFinals = [];
         this.turnConfidences = [];
-        if (!question) return;
+        this.turnStartedAt = 0;
+        if (!fragment) return;
+
+        // Slow / non-native speakers pause between clauses long enough to end a "turn"
+        // ("In your paper," … "the explanation score improved by two points." … "So how
+        // do you know …?"). Chain fragments that follow each other closely, with no user
+        // speech in between, so the question answered is the whole question.
+        const now = Date.now();
+        const last = this.turnChain[this.turnChain.length - 1];
+        // A fresh question ("What will you do …?") after an already-answered part of the
+        // chain starts a new chain; a continuation ("And not just …?") extends it.
+        const startsNewQuestion = /^(what|why|how|when|where|which|who|can|could|would|will|do|does|did|is|are|have|has|tell|please|let me|let's|i have another|another question|next question)\b/i.test(fragment);
+        // Gap = silence between the previous fragment's end and this one's first word.
+        if (!last || startedAt - last.endedAt > this.TURN_CHAIN_GAP_MS || this.lastUserSpeechTime > last.endedAt ||
+            (startsNewQuestion && this.turnChain.some(f => f.answered))) {
+            this.turnChain = [];
+        }
+        this.turnChain.push({ text: fragment, endedAt: now, answered: false });
+        if (this.turnChain.length > this.TURN_CHAIN_MAX) this.turnChain.shift();
+        const question = this.turnChain.map(f => f.text).join(' ');
 
         if (!this.isAutoReplyEnabled()) return;
 
-        const words = question.split(/\s+/).filter(Boolean);
-        if (words.length < this.AUTO_ANSWER_MIN_WORDS) return;
-        if (!IntelligenceEngine.looksLikePrompt(question)) {
-            console.log(`[IntelligenceEngine] Turn ended (${reason}) without a question signal — not auto-answering: "${question.substring(0, 60)}"`);
+        if (question.split(/\s+/).filter(Boolean).length < this.AUTO_ANSWER_MIN_WORDS) return;
+        // Fire on a fragment that is itself a prompt, or on a continuation of an earlier
+        // prompt that has not been answered yet. Once the chain was answered, only a new
+        // prompt fragment fires again — a trailing "Okay, great, thanks for that." never does.
+        const chainAnswered = this.turnChain.some(f => f.answered);
+        const isQuestion = IntelligenceEngine.hasQuestionSignal(fragment) ||
+            (!chainAnswered && IntelligenceEngine.hasQuestionSignal(question));
+        const isStatementPrompt = !isQuestion && (IntelligenceEngine.looksLikePrompt(fragment) ||
+            (!chainAnswered && IntelligenceEngine.looksLikePrompt(question)));
+        if (!isQuestion && !isStatementPrompt) {
+            console.log(`[IntelligenceEngine] Turn ended (${reason}) without a question signal — not auto-answering: "${fragment.substring(0, 60)}"`);
             return;
         }
+        if (isStatementPrompt) {
+            // A comment ("…but the accuracy improved only by 0.5.") often leads into the
+            // real question. Give the interviewer a moment; new speech cancels this and
+            // the chain then carries the comment into the question.
+            this.clearStatementTimer();
+            this.statementTimer = setTimeout(() => {
+                this.statementTimer = null;
+                this.fireAutoAnswer(question, confidences, `${reason}+statement`);
+            }, this.STATEMENT_GRACE_MS);
+            return;
+        }
+        this.fireAutoAnswer(question, confidences, reason);
+    }
+
+    private clearStatementTimer(): void {
+        if (this.statementTimer !== null) {
+            clearTimeout(this.statementTimer);
+            this.statementTimer = null;
+        }
+    }
+
+    private fireAutoAnswer(question: string, confidences: number[], reason: string): void {
+        if (!this.isAutoReplyEnabled()) return;
         if (Date.now() - this.lastUserSpeechTime < this.USER_SPEAKING_SUPPRESS_MS) {
             console.log('[IntelligenceEngine] Turn ended while the user is speaking — not auto-answering');
             return;
@@ -327,10 +390,13 @@ export class IntelligenceEngine extends EventEmitter {
         // Same question re-finalized / repeated within the dedupe window
         if (Date.now() - this.lastAutoQuestionTime < this.AUTO_ANSWER_DEDUPE_MS &&
             IntelligenceEngine.jaccardSimilarity(this.lastAutoQuestion, question) >= 0.8) {
+            // Already answered moments ago — the chain counts as answered.
+            for (const f of this.turnChain) f.answered = true;
             return;
         }
         this.lastAutoQuestion = question;
         this.lastAutoQuestionTime = Date.now();
+        for (const f of this.turnChain) f.answered = true;
 
         const confidence = confidences.length
             ? Math.max(0.5, confidences.reduce((a, b) => a + b, 0) / confidences.length)
@@ -348,6 +414,11 @@ export class IntelligenceEngine extends EventEmitter {
         this.lastTranscriptTime = Date.now();
 
         if (segment.speaker === 'interviewer') {
+            // Interviewer kept talking after a comment — wait for the real question.
+            if (segment.text.trim()) {
+                this.clearStatementTimer();
+                if (this.turnStartedAt === 0) this.turnStartedAt = Date.now();
+            }
             if (!segment.final) {
                 // Interviewer is still talking — hold the turn open.
                 if (this.turnFinals.length > 0 && segment.text.trim()) this.clearTurnTimer();
@@ -1166,6 +1237,9 @@ export class IntelligenceEngine extends EventEmitter {
         this.clearTurnTimer();
         this.turnFinals = [];
         this.turnConfidences = [];
+        this.turnChain = [];
+        this.turnStartedAt = 0;
+        this.clearStatementTimer();
         this.lastUserSpeechTime = 0;
         this.lastAutoQuestion = '';
         this.lastAutoQuestionTime = 0;

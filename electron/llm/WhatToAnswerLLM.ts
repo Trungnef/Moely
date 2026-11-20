@@ -197,7 +197,8 @@ ${sessionDigest.trim().slice(0, 3000)}
 
         } catch (error) {
             console.error("[WhatToAnswerLLM] Stream failed:", error);
-            yield "Could you repeat that? I want to make sure I address your question properly.";
+            // Clearly a note, not a line to read aloud — the user must know the AI failed.
+            yield "_(AI answer unavailable: connection or provider error. Answer from your notes, or say: \"Could you please repeat the question?\")_";
         }
     }
 }

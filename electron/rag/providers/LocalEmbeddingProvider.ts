@@ -13,10 +13,12 @@ export class LocalEmbeddingProvider implements IEmbeddingProvider {
 
   constructor() {
     // Point to the bundled model inside the app's resources.
-    // In dev: __dirname = dist-electron/electron/rag/providers → need 4 levels up to project root.
+    // In dev: resolve from the app path (project root). __dirname is unreliable here —
+    // esbuild bundles this file into dist-electron/electron/main.js, so the old
+    // "4 levels up" pointed one directory ABOVE the project and the model never loaded.
     // In prod: app.isPackaged = true → use process.resourcesPath (electron-builder extraResources).
     this.modelPath = path.join(
-      app.isPackaged ? process.resourcesPath : path.join(__dirname, '../../../../resources'),
+      app.isPackaged ? process.resourcesPath : path.join(app.getAppPath(), 'resources'),
       'models'
     );
   }

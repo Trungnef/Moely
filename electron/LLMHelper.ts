@@ -2840,13 +2840,46 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     if (this.isAzureOpenAiModel(this.currentModelId) && this.hasAzureOpenAI()) {
       const openAiSystem = systemPromptOverride || OPENAI_SYSTEM_PROMPT;
       const finalOpenAiSystem = this.injectLanguageInstruction(openAiSystem);
-      yield* this.streamWithAzureOpenAI(
-        userContent,
-        finalOpenAiSystem,
-        isMultimodal && imagePaths ? imagePaths : undefined,
-        this.currentModelId,
-      );
-      return;
+      // Azure used to have no fallback: one 429/5xx/network blip during a live
+      // interview surfaced as a canned "Could you repeat that?" answer. Retry once on
+      // transient errors, then fall back to Gemini, then Groq — but only while nothing
+      // has been streamed yet (a half-streamed answer cannot be restarted cleanly).
+      let yielded = false;
+      const attemptAzure = async function* (this: LLMHelper) {
+        for await (const tok of this.streamWithAzureOpenAI(userContent, finalOpenAiSystem, isMultimodal && imagePaths ? imagePaths : undefined, this.currentModelId)) {
+          yielded = true;
+          yield tok;
+        }
+      }.bind(this);
+      let lastErr: any = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          yield* attemptAzure();
+          return;
+        } catch (err: any) {
+          lastErr = err;
+          if (yielded) throw err;
+          const transient = /\((429|5\d\d)\)|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|fetch failed|network|socket/i.test(String(err?.message));
+          console.warn(`[LLMHelper] Azure OpenAI stream failed (attempt ${attempt + 1}${transient ? ', transient' : ''}): ${err?.message}`);
+          if (!transient) break;
+          await new Promise(r => setTimeout(r, 400));
+        }
+      }
+      if (this.client) {
+        try {
+          console.warn(`[LLMHelper] Falling back from Azure to Gemini (${GEMINI_FLASH_MODEL})`);
+          yield* this.streamWithGeminiModel(userContent, GEMINI_FLASH_MODEL, isMultimodal ? imagePaths : undefined, finalOpenAiSystem);
+          return;
+        } catch (gemErr: any) {
+          console.warn('[LLMHelper] Gemini fallback failed:', gemErr?.message);
+        }
+      }
+      if (this.groqClient && !isMultimodal) {
+        console.warn('[LLMHelper] Falling back from Azure to Groq');
+        yield* this.streamWithGroq(userContent, GROQ_MODEL, finalOpenAiSystem);
+        return;
+      }
+      throw lastErr;
     }
 
     // OpenAI
