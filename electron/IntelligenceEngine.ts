@@ -132,6 +132,9 @@ export class IntelligenceEngine extends EventEmitter {
     // Extra wait before answering a comment-style prompt (no question signal).
     private statementTimer: ReturnType<typeof setTimeout> | null = null;
     private readonly STATEMENT_GRACE_MS = 1500;
+    // Interviewer words heard recently — used to recognise speaker→mic echo.
+    private recentInterviewerWords: Array<{ words: Set<string>; at: number }> = [];
+    private readonly ECHO_WINDOW_MS = 8000;
     private readonly AUTO_ANSWER_DEDUPE_MS = 20000;
 
     // The what-to-say answer currently streaming into the UI, so a newer generation
@@ -372,6 +375,31 @@ export class IntelligenceEngine extends EventEmitter {
         this.fireAutoAnswer(question, confidences, reason);
     }
 
+    private rememberInterviewerSpeech(text: string): void {
+        const now = Date.now();
+        this.recentInterviewerWords.push({ words: IntelligenceEngine.wordsOf(text), at: now });
+        this.recentInterviewerWords = this.recentInterviewerWords.filter(e => now - e.at <= this.ECHO_WINDOW_MS);
+    }
+
+    /**
+     * Mic text that is mostly made of words the interviewer said in the last few
+     * seconds is the speakers leaking into the mic, not the user speaking.
+     */
+    private isLikelyEcho(text: string): boolean {
+        const now = Date.now();
+        const recent = this.recentInterviewerWords.filter(e => now - e.at <= this.ECHO_WINDOW_MS);
+        if (recent.length === 0) return false;
+        const words = Array.from(IntelligenceEngine.wordsOf(text));
+        if (words.length === 0) return false;
+        const pool = new Set<string>();
+        for (const e of recent) e.words.forEach(w => pool.add(w));
+        const covered = words.filter(w => pool.has(w)).length / words.length;
+        // Very short mic fragments ("okay", "so") are only echo while the interviewer is
+        // actually talking; longer ones need most of their words to match.
+        if (words.length <= 2) return covered === 1 && now - recent[recent.length - 1].at <= 1500;
+        return covered >= 0.6;
+    }
+
     private clearStatementTimer(): void {
         if (this.statementTimer !== null) {
             clearTimeout(this.statementTimer);
@@ -410,6 +438,16 @@ export class IntelligenceEngine extends EventEmitter {
      * Process transcript from native audio, and trigger follow-up if appropriate
      */
     handleTranscript(segment: TranscriptSegment, skipRefinementCheck: boolean = false): void {
+        if (segment.speaker === 'interviewer' && segment.text.trim()) {
+            this.rememberInterviewerSpeech(segment.text);
+        } else if (segment.speaker === 'user' && this.isLikelyEcho(segment.text)) {
+            // Without headphones the mic re-captures the interviewer from the speakers.
+            // Treating that as the user talking blocked every auto-answer (user-speaking
+            // suppression) and duplicated the interviewer's words as "ME" in the context.
+            if (segment.final) console.log(`[IntelligenceEngine] Ignoring mic echo of interviewer: "${segment.text.substring(0, 60)}"`);
+            return;
+        }
+
         const result = this.session.handleTranscript(segment);
         this.lastTranscriptTime = Date.now();
 
@@ -1239,6 +1277,7 @@ export class IntelligenceEngine extends EventEmitter {
         this.turnConfidences = [];
         this.turnChain = [];
         this.turnStartedAt = 0;
+        this.recentInterviewerWords = [];
         this.clearStatementTimer();
         this.lastUserSpeechTime = 0;
         this.lastAutoQuestion = '';
