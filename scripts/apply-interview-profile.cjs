@@ -126,6 +126,14 @@ app.whenReady().then(() => {
         for (const [k, v] of Object.entries(m.settings || {})) settings.set(k, v);
         if (Array.isArray(m.sttKeyterms)) settings.set('sttKeyterms', m.sttKeyterms);
 
+        // ── Save as an interview preset (switchable from Profile → Interview presets) ──
+        const { InterviewPresetManager } = load('services/InterviewPresetManager.js');
+        const presets = InterviewPresetManager.getInstance();
+        const presetName = m.presetName || m.modeName;
+        const existing = presets.list().find(p => p.name === presetName);
+        const preset = presets.save({ ...presets.captureCurrent(), id: existing?.id, name: presetName, kind: m.presetKind || 'other' });
+        presets.apply(preset.id);
+
         // ── Verify by reading back ──────────────────────────────────────────
         const block = modes.buildActiveModeContextBlock();
         const active = modes.getActiveMode();
@@ -138,6 +146,7 @@ app.whenReady().then(() => {
         console.log(`  Profile mode    : ${db.getAppState('persona:mode') === '1' ? 'on' : 'off'}`);
         console.log(`  Auto-answer     : ${settings.get('autoReplyOnFinal') !== false ? 'on' : 'off'}, early answers: ${settings.get('speculativeAnswers') ? 'on' : 'off'}`);
         console.log(`  STT keyterms    : ${(settings.get('sttKeyterms') || []).length}`);
+        console.log(`  Preset          : "${preset.name}" (${preset.kind}) saved and active`);
         console.log(`  Backup          : ${backupPath}`);
         app.exit(0);
     } catch (err) {

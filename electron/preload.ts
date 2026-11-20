@@ -370,6 +370,12 @@ interface ElectronAPI {
   modesCreate: (params: { name: string; templateType: string }) => Promise<{ success: boolean; mode?: any; error?: string }>;
   modesUpdate: (id: string, updates: { name?: string; templateType?: string; customContext?: string }) => Promise<{ success: boolean; error?: string }>;
   modesDelete: (id: string) => Promise<{ success: boolean; error?: string }>;
+  interviewPresetsList: () => Promise<{ presets: Array<{ id: string; name: string; kind: 'company' | 'scholarship' | 'other'; modeId: string | null; useProfile: boolean; customNotes: string; sttLanguage: string; sttLanguageInterviewer: string; aiResponseLanguage: string; sttKeyterms: string[]; createdAt: string; updatedAt: string }>; activeId: string | null }>;
+  interviewPresetsCapture: () => Promise<Omit<{ id: string; name: string; kind: 'company' | 'scholarship' | 'other'; modeId: string | null; useProfile: boolean; customNotes: string; sttLanguage: string; sttLanguageInterviewer: string; aiResponseLanguage: string; sttKeyterms: string[]; createdAt: string; updatedAt: string }, 'id' | 'name' | 'kind' | 'createdAt' | 'updatedAt'>>;
+  interviewPresetsSave: (preset: Partial<{ id: string; name: string; kind: 'company' | 'scholarship' | 'other'; modeId: string | null; useProfile: boolean; customNotes: string; sttLanguage: string; sttLanguageInterviewer: string; aiResponseLanguage: string; sttKeyterms: string[]; createdAt: string; updatedAt: string }>) => Promise<{ success: boolean; preset?: { id: string; name: string; kind: 'company' | 'scholarship' | 'other'; modeId: string | null; useProfile: boolean; customNotes: string; sttLanguage: string; sttLanguageInterviewer: string; aiResponseLanguage: string; sttKeyterms: string[]; createdAt: string; updatedAt: string }; error?: string }>;
+  interviewPresetsDelete: (id: string) => Promise<{ success: boolean; error?: string }>;
+  interviewPresetsApply: (id: string) => Promise<{ success: boolean; preset?: { id: string; name: string; kind: 'company' | 'scholarship' | 'other'; modeId: string | null; useProfile: boolean; customNotes: string; sttLanguage: string; sttLanguageInterviewer: string; aiResponseLanguage: string; sttKeyterms: string[]; createdAt: string; updatedAt: string }; error?: string }>;
+  onInterviewPresetApplied: (callback: (data: { id: string; name: string }) => void) => () => void;
   modesSetActive: (id: string | null) => Promise<{ success: boolean; error?: string }>;
   modesGetReferenceFiles: (modeId: string) => Promise<Array<{ id: string; modeId: string; fileName: string; content: string; createdAt: string }>>;
   modesUploadReferenceFile: (modeId: string) => Promise<{ success: boolean; cancelled?: boolean; file?: any; error?: string }>;
@@ -1362,6 +1368,16 @@ contextBridge.exposeInMainWorld("electronAPI", {
   modesCreate: (params: { name: string; templateType: string }) => ipcRenderer.invoke('modes:create', params),
   modesUpdate: (id: string, updates: { name?: string; templateType?: string; customContext?: string }) => ipcRenderer.invoke('modes:update', id, updates),
   modesDelete: (id: string) => ipcRenderer.invoke('modes:delete', id),
+  interviewPresetsList: () => ipcRenderer.invoke('interview-presets:list'),
+  interviewPresetsCapture: () => ipcRenderer.invoke('interview-presets:capture'),
+  interviewPresetsSave: (preset: any) => ipcRenderer.invoke('interview-presets:save', preset),
+  interviewPresetsDelete: (id: string) => ipcRenderer.invoke('interview-presets:delete', id),
+  interviewPresetsApply: (id: string) => ipcRenderer.invoke('interview-presets:apply', id),
+  onInterviewPresetApplied: (callback: (data: { id: string; name: string }) => void) => {
+    const subscription = (_: any, data: { id: string; name: string }) => callback(data);
+    ipcRenderer.on('interview-preset-applied', subscription);
+    return () => { ipcRenderer.removeListener('interview-preset-applied', subscription); };
+  },
   modesSetActive: (id: string | null) => ipcRenderer.invoke('modes:set-active', id),
   modesGetReferenceFiles: (modeId: string) => ipcRenderer.invoke('modes:get-reference-files', modeId),
   modesUploadReferenceFile: (modeId: string) => ipcRenderer.invoke('modes:upload-reference-file', modeId),

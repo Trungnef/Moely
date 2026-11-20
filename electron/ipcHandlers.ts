@@ -3413,6 +3413,67 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  // ── Interview presets (company vs scholarship vs ... one-click switching) ──
+  {
+    const { InterviewPresetManager } = require('./services/InterviewPresetManager');
+    const broadcast = (channel: string, payload: any) => BrowserWindow.getAllWindows().forEach(win => {
+      if (!win.isDestroyed()) win.webContents.send(channel, payload);
+    });
+    InterviewPresetManager.getInstance().setLiveHooks({
+      setRecognitionLanguage: (key: string) => appState.setRecognitionLanguage(key),
+      setInterviewerRecognitionLanguage: (key: string) => appState.setInterviewerRecognitionLanguage(key),
+      setAiResponseLanguage: (lang: string) => appState.processingHelper?.getLLMHelper?.()?.setAiResponseLanguage(lang),
+      setCustomNotes: (notes: string) => {
+        appState.getKnowledgeOrchestrator()?.setCustomNotes?.(notes);
+        const llm: any = appState.processingHelper?.getLLMHelper?.();
+        llm?.setCustomNotes?.(notes);
+      },
+      setSttKeyterms: (terms: string[]) => appState.setSttKeyterms(terms),
+      onModeChanged: (id: string | null, name: string | null) => broadcast('mode-changed', { id, name }),
+      onApplied: (preset: any) => broadcast('interview-preset-applied', { id: preset.id, name: preset.name }),
+    });
+  }
+
+  safeHandle("interview-presets:list", async () => {
+    const { InterviewPresetManager } = require('./services/InterviewPresetManager');
+    const m = InterviewPresetManager.getInstance();
+    return { presets: m.list(), activeId: m.getActiveId() };
+  });
+
+  safeHandle("interview-presets:capture", async () => {
+    const { InterviewPresetManager } = require('./services/InterviewPresetManager');
+    return InterviewPresetManager.getInstance().captureCurrent();
+  });
+
+  safeHandle("interview-presets:save", async (_, preset: any) => {
+    try {
+      const { InterviewPresetManager } = require('./services/InterviewPresetManager');
+      return { success: true, preset: InterviewPresetManager.getInstance().save(preset || {}) };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  });
+
+  safeHandle("interview-presets:delete", async (_, id: string) => {
+    try {
+      const { InterviewPresetManager } = require('./services/InterviewPresetManager');
+      InterviewPresetManager.getInstance().delete(id);
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  });
+
+  safeHandle("interview-presets:apply", async (_, id: string) => {
+    try {
+      const { InterviewPresetManager } = require('./services/InterviewPresetManager');
+      return { success: true, preset: InterviewPresetManager.getInstance().apply(id) };
+    } catch (e: any) {
+      console.error('[IPC] interview-presets:apply error:', e);
+      return { success: false, error: e.message };
+    }
+  });
+
   safeHandle("modes:set-active", async (_, id: string | null) => {
     try {
       const { ModesManager } = require('./services/ModesManager');

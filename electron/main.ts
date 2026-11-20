@@ -3085,6 +3085,12 @@ export class AppState {
     this.processingHelper.getLLMHelper().setSttLanguage(key);
   }
 
+  /** Push STT keyterms to live instances (providers without keyterm support ignore it). */
+  public setSttKeyterms(terms: string[]): void {
+    (this.googleSTT as any)?.setKeyterms?.(terms);
+    (this.googleSTT_User as any)?.setKeyterms?.(terms);
+  }
+
   /** Set (or clear with '') the interviewer/system-audio recognition language. */
   public setInterviewerRecognitionLanguage(key: string): void {
     console.log(`[AppState] Setting interviewer recognition language to: ${key || '(same as main)'}`);

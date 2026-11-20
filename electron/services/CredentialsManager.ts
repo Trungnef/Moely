@@ -68,6 +68,10 @@ export interface StoredCredentials {
 export class CredentialsManager {
     private static instance: CredentialsManager;
     private credentials: StoredCredentials = {};
+    // True once the on-disk file has been read. Until then this.credentials is NOT the
+    // user's data, and writing it would wipe every stored key (this happened when a
+    // second, never-initialized copy of this class — e.g. from another bundle — saved).
+    private loaded = false;
 
     private constructor() {
         // Load on construction after app ready
@@ -77,7 +81,9 @@ export class CredentialsManager {
         if (!CredentialsManager.instance) {
             CredentialsManager.instance = new CredentialsManager();
         }
-        return CredentialsManager.instance;
+        const inst = CredentialsManager.instance;
+        if (!inst.loaded && app.isReady()) inst.loadCredentials();
+        return inst;
     }
 
     /**
@@ -515,8 +521,24 @@ export class CredentialsManager {
     // =========================================================================
 
     private saveCredentials(): void {
+        if (!this.loaded) {
+            if (!app.isReady()) {
+                console.error('[CredentialsManager] Refusing to save before credentials were loaded (app not ready).');
+                return;
+            }
+            // Merge the pending change over what is on disk instead of replacing it.
+            const pending = this.credentials;
+            this.loadCredentials();
+            this.credentials = { ...this.credentials, ...pending };
+        }
         try {
             const credentialsPath = getCredentialsPath();
+            // Keep one previous generation so a bad write is always recoverable.
+            try {
+                if (fs.existsSync(credentialsPath)) fs.copyFileSync(credentialsPath, credentialsPath + '.bak');
+            } catch (bakErr) {
+                console.warn('[CredentialsManager] Could not write credentials backup:', bakErr);
+            }
             if (!safeStorage.isEncryptionAvailable()) {
                 console.warn('[CredentialsManager] Encryption not available, falling back to plaintext');
                 // Fallback: save as plaintext (less secure, but functional)
@@ -538,6 +560,7 @@ export class CredentialsManager {
     }
 
     private loadCredentials(): void {
+        this.loaded = true;
         try {
             const credentialsPath = getCredentialsPath();
             // Try encrypted file first

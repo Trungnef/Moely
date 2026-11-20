@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
 import { motion, AnimatePresence } from 'framer-motion';
+import { InterviewPresetsCard } from './settings/InterviewPresetsCard';
 
 const spring = { type: "spring" as const, stiffness: 100, damping: 20 };
 
@@ -458,6 +459,19 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
         };
     }, []);
 
+    // A preset may toggle the Persona Engine and replace the custom notes.
+    const refreshAfterPreset = useCallback(() => {
+        window.electronAPI?.profileGetStatus?.().then((s: any) => { if (s) setProfileStatus(s); }).catch(() => { });
+        window.electronAPI?.profileGetNotes?.().then((res: any) => {
+            if (res?.success) {
+                const content = res.content ?? res.notes ?? '';
+                setCustomNotes(content);
+                customNotesRef.current = content;
+                lastSavedCustomNotesRef.current = content;
+            }
+        }).catch(() => { });
+    }, []);
+
     const handleRemoveTavilyKey = async () => {
         if (!confirm('Are you sure you want to remove your Tavily API key?')) return;
         try {
@@ -515,6 +529,11 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
             <div className="flex-1 overflow-y-auto">
                 <div className="max-w-3xl mx-auto p-5 pb-12">
                     <div className="space-y-6">
+                        {/* Interview presets: company vs scholarship vs ... one-click switching */}
+                        <BezelCard delay={0.12}>
+                            <InterviewPresetsCard onApplied={refreshAfterPreset} />
+                        </BezelCard>
+
                         <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.15, ...spring }} className="mb-4 pt-2">
                             <h3 className="text-lg font-bold text-text-primary tracking-tight">Professional Identity</h3>
                             <p className="text-[13px] text-text-secondary mt-1">
