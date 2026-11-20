@@ -34,6 +34,8 @@ export class DeepgramStreamingSTT extends EventEmitter {
     private languageCode = 'en';
     // Set when nova-3 refuses a non-English language at handshake — retry on nova-2.
     private forceNova2 = false;
+    // nova-3 keyterm prompting: boosts recognition of names/jargon (e.g. "JAIST", "ContractNLI").
+    private keyterms: string[] = [];
 
     private reconnectAttempts = 0;
     private reconnectTimer: NodeJS.Timeout | null = null;
@@ -70,6 +72,15 @@ export class DeepgramStreamingSTT extends EventEmitter {
     }
 
     public setCredentials(_path: string): void { }
+
+    /** Terms to boost (nova-3 only). Applied on the next connection; restarts an active stream. */
+    public setKeyterms(terms: string[]): void {
+        const next = Array.from(new Set((terms || []).map(t => String(t).trim()).filter(Boolean))).slice(0, 100);
+        if (next.join('\u0000') === this.keyterms.join('\u0000')) return;
+        this.keyterms = next;
+        console.log(`[DeepgramStreaming] ${next.length} keyterm(s) configured`);
+        if (this.isActive) this.restartStream();
+    }
 
     private getModel(): string {
         if (this.forceNova2) return 'nova-2';
@@ -155,7 +166,7 @@ export class DeepgramStreamingSTT extends EventEmitter {
 
             const deepgram = createClient(this.apiKey);
 
-            const live = deepgram.listen.live({
+            const options: Record<string, unknown> = {
                 model,
                 language: this.languageCode,
                 smart_format: true,
@@ -166,7 +177,10 @@ export class DeepgramStreamingSTT extends EventEmitter {
                 endpointing: 300,
                 utterance_end_ms: 1000,
                 vad_events: true,
-            });
+            };
+            // The SDK serializes arrays as repeated ?keyterm= params (verified accepted by nova-3).
+            if (model === 'nova-3' && this.keyterms.length > 0) options.keyterm = this.keyterms;
+            const live = deepgram.listen.live(options);
             this.live = live;
             let opened = false;
             // Every handler is bound to THIS connection. A restart (e.g. the first

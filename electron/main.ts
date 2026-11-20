@@ -991,7 +991,10 @@ export class AppState {
       const apiKey = CredentialsManager.getInstance().getDeepgramApiKey();
       if (apiKey) {
         console.log(`[Main] Using DeepgramStreamingSTT for ${speaker}`);
-        stt = new DeepgramStreamingSTT(apiKey);
+        const dg = new DeepgramStreamingSTT(apiKey);
+        const keyterms = SettingsManager.getInstance().get('sttKeyterms');
+        if (Array.isArray(keyterms) && keyterms.length > 0) dg.setKeyterms(keyterms);
+        stt = dg;
       } else {
         console.warn(`[Main] No API key for Deepgram STT, falling back to GoogleSTT`);
         stt = new GoogleSTT(speaker);

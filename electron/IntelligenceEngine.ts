@@ -201,9 +201,20 @@ export class IntelligenceEngine extends EventEmitter {
     private static hasQuestionSignal(text: string): boolean {
         const t = text.trim();
         if (t.includes('?')) return true;
-        if (/\b(what|how|why|where|when|which|who|whom|whose|can you|could you|would you|will you|do you|did you|have you|are you|were you|is there|are there|tell me|tell us|explain|describe|walk me through|walk us through|talk me through|talk about|give me|share|let's discuss|let's talk)\b/i.test(t)) return true;
+        if (/\b(what|how|why|where|when|which|who|whom|whose|can you|could you|would you|will you|do you|did you|have you|are you|were you|is there|are there|tell me|tell us|explain|describe|walk me through|walk us through|talk me through|talk about|give me|share|let's discuss|let's talk|please|elaborate|clarify|justify|compare|wonder|wondering|curious|concern|concerns|concerned|worried|worry|doubt|not sure|not convinced|skeptical|unclear|limitation|weakness|risk|your opinion|your thoughts|how about|what about|any idea|is it possible)\b/i.test(t)) return true;
         // Vietnamese (no \b — JS word boundaries don't understand diacritics)
         return /(\s(không|chưa|nhỉ|nhé|à|hả)\s*[.!]?$|gì|nào|tại sao|vì sao|thế nào|ra sao|làm sao|bao nhiêu|bao lâu|ở đâu|khi nào|hãy |kể (cho|về|lại)|giới thiệu|giải thích|mô tả|trình bày|chia sẻ|cho (tôi|mình|chị|anh|em|chúng tôi) biết|có thể|được không)/i.test(t);
+    }
+
+    /**
+     * End-of-turn prompt test: a question, OR a longer challenge/opinion statement
+     * that clearly expects a reply ("I think ContractNLI is quite different from
+     * real manuals."). Short acknowledgements ("OK, thank you.") stay silent.
+     */
+    private static looksLikePrompt(text: string): boolean {
+        if (IntelligenceEngine.hasQuestionSignal(text)) return true;
+        const words = text.trim().split(/\s+/).filter(Boolean).length;
+        return words >= 8 && /\b(i think|i feel|i believe|it seems|seems|in my opinion|in my view|similar|different|differs|but|however|actually|already|standard|simple|weak|strong)\b/i.test(text);
     }
 
     private getSetting<T>(key: string, fallback: T): T {
@@ -303,7 +314,7 @@ export class IntelligenceEngine extends EventEmitter {
 
         const words = question.split(/\s+/).filter(Boolean);
         if (words.length < this.AUTO_ANSWER_MIN_WORDS) return;
-        if (!IntelligenceEngine.hasQuestionSignal(question)) {
+        if (!IntelligenceEngine.looksLikePrompt(question)) {
             console.log(`[IntelligenceEngine] Turn ended (${reason}) without a question signal — not auto-answering: "${question.substring(0, 60)}"`);
             return;
         }

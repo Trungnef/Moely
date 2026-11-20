@@ -23,6 +23,8 @@ export interface AppSettings {
     // Start generating on stable interim text before the turn ends (lower latency,
     // may answer half a question). Default false. Only applies with autoReplyOnFinal.
     speculativeAnswers?: boolean;
+    // Domain terms boosted by streaming STT (Deepgram nova-3 keyterm prompting): names, acronyms, jargon.
+    sttKeyterms?: string[];
     phoneMirrorEnabled?: boolean;
     phoneMirrorExposeOnLan?: boolean;
     localWhisperModel?: string;

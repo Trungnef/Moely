@@ -252,3 +252,5 @@ refactor_profile.py
 refactor.js
 skills-lock.json
 windowswork.md
+# Personal interview material (CV, slides, scripts, context packs) — never commit
+data/
