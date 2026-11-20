@@ -12,6 +12,8 @@ export interface TranscriptSegment {
     timestamp: number;
     final: boolean;
     confidence?: number;
+    // Provider endpointing saw trailing silence after this final (Deepgram speech_final, Soniox <end>)
+    speechFinal?: boolean;
 }
 
 export interface SuggestionTrigger {
@@ -36,7 +38,9 @@ export interface AssistantResponse {
 export class SessionTracker {
     // Context management (mirrors Swift ContextManager)
     private contextItems: ContextItem[] = [];
-    private readonly contextWindowDuration: number = 120; // 120 seconds
+    // Must be ≥ IntelligenceEngine.ANSWER_CONTEXT_SECONDS — anything older is evicted
+    // before the answer path can ask for it (it used to be 120s while answers asked for 180s).
+    private readonly contextWindowDuration: number = 420; // 7 minutes
     private readonly maxContextItems: number = 500;
 
     // Last assistant message for follow-up mode
@@ -399,6 +403,30 @@ export class SessionTracker {
         }
 
         return recentTranscript;
+    }
+
+    /**
+     * Compact memory of the interview BEFORE the live answer window: epoch
+     * summaries plus the interviewer questions asked earlier. Lets live answers
+     * stay consistent with what was already said without resending old transcript.
+     */
+    getEarlierSessionDigest(olderThanSeconds: number, maxQuestions: number = 12): string {
+        const cutoff = Date.now() - olderThanSeconds * 1000;
+        const earlierQuestions = this.fullTranscript
+            .filter(s => s.final && s.timestamp < cutoff && this.mapSpeakerToRole(s.speaker) === 'interviewer')
+            .map(s => s.text.trim())
+            .filter(t => t.split(/\s+/).length >= 4)
+            .slice(-maxQuestions)
+            .map(t => `- ${t.length > 180 ? t.slice(0, 180) + '…' : t}`);
+
+        const parts: string[] = [];
+        if (this.transcriptEpochSummaries.length > 0) {
+            parts.push(`Summary of earlier discussion:\n${this.transcriptEpochSummaries.slice(-2).join('\n---\n')}`);
+        }
+        if (earlierQuestions.length > 0) {
+            parts.push(`Interviewer lines from earlier in this interview (already discussed):\n${earlierQuestions.join('\n')}`);
+        }
+        return parts.join('\n\n');
     }
 
     // ============================================

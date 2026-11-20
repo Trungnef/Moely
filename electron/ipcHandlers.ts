@@ -11,6 +11,8 @@ import { AudioDevices } from "./audio/AudioDevices";
 import { PhoneMirrorService } from "./services/PhoneMirrorService";
 import { CodexCliService } from "./services/CodexCliService";
 import { SettingsManager } from "./services/SettingsManager";
+import { PersonaEngine } from "./services/PersonaEngine";
+import { CareerIntelligenceEngine } from "./core/intelligence_engine";
 
 
 import { RECOGNITION_LANGUAGES, AI_RESPONSE_LANGUAGES } from "./config/languages"
@@ -23,42 +25,15 @@ export function initializeIpcHandlers(appState: AppState): void {
     ipcMain.handle(channel, listener);
   };
 
-  /**
-   * Returns true if the user has an active premium license OR an unexpired free trial.
-   * Used to gate profile intelligence features (resume upload, JD upload, company research, etc.).
-   */
-  const isProOrTrialActive = (): boolean => {
-    // 1. Full premium license (Dodo / Gumroad / Natively API subscription)
-    try {
-      const { LicenseManager } = require('../premium/electron/services/LicenseManager');
-      if (LicenseManager.getInstance().isPremium()) return true;
-    } catch { /* premium module not available */ }
+  const llmHelper = appState.processingHelper?.getLLMHelper?.();
+  if (llmHelper) {
+    CareerIntelligenceEngine.getInstance().setLLMHelper(llmHelper);
+  }
 
-    // 2. Active free trial (token present and not expired)
-    try {
-      const { CredentialsManager } = require('./services/CredentialsManager');
-      const cm = CredentialsManager.getInstance();
-      const token = cm.getTrialToken();
-      if (!token) return false;
-      const expiresAt = cm.getTrialExpiresAt();
-      if (!expiresAt) return false;
-      return new Date(expiresAt).getTime() > Date.now();
-    } catch {
-      return false;
-    }
-  };
-
-  // Clears the active mode when the pro license is lost so non-general mode prompts
-  // and reference files stop being injected into LLM calls.
-  const clearActiveModeOnLicenseLoss = (): void => {
-    try {
-      const { DatabaseManager } = require('./db/DatabaseManager');
-      DatabaseManager.getInstance().setActiveMode(null);
-      BrowserWindow.getAllWindows().forEach(win => {
-        if (!win.isDestroyed()) win.webContents.send('modes-active-cleared');
-      });
-      console.log('[IPC] Active mode cleared due to license loss');
-    } catch (e) { /* non-fatal */ }
+  const broadcastLicenseStatus = (isPremium: boolean = true): void => {
+    BrowserWindow.getAllWindows().forEach(win => {
+      if (!win.isDestroyed()) win.webContents.send('license-status-changed', { isPremium });
+    });
   };
 
   // --- NEW Test Helper ---
@@ -109,32 +84,17 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
   safeHandle("license:check-premium", async () => {
-    try {
-      const { LicenseManager } = require('../premium/electron/services/LicenseManager');
-      return LicenseManager.getInstance().isPremium();
-    } catch {
-      return false;
-    }
+    return true;
   });
 
   safeHandle("license:get-details", async () => {
-    try {
-      const { LicenseManager } = require('../premium/electron/services/LicenseManager');
-      return LicenseManager.getInstance().getLicenseDetails();
-    } catch {
-      return { isPremium: false };
-    }
+    return { isPremium: true, plan: 'unlocked', provider: 'local' };
   });
   // Async variant: performs Dodo server-side revocation check on startup.
   // Returns false only if the server definitively revokes the key.
   // Network errors fail-open (returns cached sync result).
   safeHandle("license:check-premium-async", async () => {
-    try {
-      const { LicenseManager } = require('../premium/electron/services/LicenseManager');
-      return await LicenseManager.getInstance().isPremiumAsync();
-    } catch {
-      return false;
-    }
+    return true;
   });
   safeHandle("license:deactivate", async () => {
     try {
@@ -150,11 +110,7 @@ export function initializeIpcHandlers(appState: AppState): void {
           console.log('[IPC] Knowledge mode auto-disabled due to license deactivation');
         }
       } catch (e) { /* ignore */ }
-      // Notify all windows so the license UI (ProGate, settings) refreshes immediately
-      clearActiveModeOnLicenseLoss();
-      BrowserWindow.getAllWindows().forEach(win => {
-        if (!win.isDestroyed()) win.webContents.send('license-status-changed', { isPremium: false });
-      });
+      broadcastLicenseStatus(true);
     } catch { /* LicenseManager not available */ }
     return { success: true };
   });
@@ -199,6 +155,11 @@ export function initializeIpcHandlers(appState: AppState): void {
   safeHandle("get-stt-language", async () => {
     const { CredentialsManager } = require('./services/CredentialsManager');
     return CredentialsManager.getInstance().getSttLanguage();
+  });
+
+  safeHandle("get-interviewer-stt-language", async () => {
+    const { CredentialsManager } = require('./services/CredentialsManager');
+    return CredentialsManager.getInstance().getSttLanguageInterviewerOverride();
   });
 
   safeHandle("get-ai-response-language", async () => {
@@ -525,6 +486,36 @@ export function initializeIpcHandlers(appState: AppState): void {
       if (!context && autoContextSnapshot) {
         context = autoContextSnapshot;
         console.log(`[IPC] Auto-injected 100s context for gemini-chat-stream (${context.length} chars)`);
+      }
+
+      // If Profile Mode is enabled, inject local Persona Engine context so the
+      // assistant remains profile-aware even when premium knowledge modules are
+      // unavailable. Keep this local and bounded: getPromptContext is a compact
+      // profile/JD summary, semanticSearch adds only the top query-relevant
+      // resume/JD/custom-context snippets. This improves grounding without the
+      // 300-800ms premium KnowledgeOrchestrator classification/search path.
+      try {
+        if (!options?.ignoreKnowledgeMode) {
+          const persona = PersonaEngine.getInstance();
+          const personaCtx = persona.getPromptContext(2600);
+          const customNotes = DatabaseManager.getInstance().getCustomNotes().trim();
+          const customNotesBlock = customNotes
+            ? `<user_custom_context>\n${customNotes.slice(0, 4000)}\n</user_custom_context>\nUse this context silently when relevant. Never say "based on your custom context".`
+            : '';
+          const relevant = persona.semanticSearch(message, 4);
+          const relevantBlock = relevant.success && relevant.results?.length
+            ? `<profile_relevant_snippets>\n${relevant.results
+                .slice(0, 4)
+                .map((item, index) => `[${index + 1}] ${item.category}: ${item.title} — ${item.snippet}`.slice(0, 420))
+                .join('\n')}\n</profile_relevant_snippets>`
+            : '';
+          const profileContext = [personaCtx, customNotesBlock, relevantBlock].filter(Boolean).join('\n');
+          if (profileContext) {
+            context = context ? `${context}\n\n${profileContext}` : profileContext;
+          }
+        }
+      } catch (personaErr) {
+        console.warn('[IPC] Failed to append persona context block:', personaErr);
       }
 
       // Use CHAT_MODE_PROMPT for general chat — bypasses the interview-copilot
@@ -1032,9 +1023,9 @@ export function initializeIpcHandlers(appState: AppState): void {
           if (details.isPremium && details.provider === 'natively_api') {
             await lm.deactivate();
             console.log('[IPC] set-natively-api-key: key cleared — natively_api Pro license deactivated.');
-            clearActiveModeOnLicenseLoss();
+            broadcastLicenseStatus(true);
             BrowserWindow.getAllWindows().forEach(win => {
-              if (!win.isDestroyed()) win.webContents.send('license-status-changed', { isPremium: false });
+              if (!win.isDestroyed()) win.webContents.send('license-status-changed', { isPremium: true });
             });
           }
         } catch (e: any) {
@@ -1248,29 +1239,14 @@ export function initializeIpcHandlers(appState: AppState): void {
         }
       } catch { /* ignore */ }
 
-      // 6. Wipe Pro-specific cached data from local SQLite
-      //    Targets: company dossiers, knowledge docs (+ cascades), resume nodes, user profile
-      //    NOT wiped: meetings, transcripts, chunks (user's own recordings)
-      try {
-        const sqliteDb = DatabaseManager.getInstance().getDb();
-        if (sqliteDb) {
-          sqliteDb.exec(`
-            DELETE FROM company_dossiers;
-            DELETE FROM knowledge_documents;
-            DELETE FROM resume_nodes;
-            DELETE FROM user_profile;
-          `);
-          console.log('[IPC] trial:end-byok: Pro data wiped from SQLite');
-        }
-      } catch (dbErr: any) {
-        console.warn('[IPC] trial:end-byok: SQLite wipe partial error:', dbErr.message);
-      }
+      // 6. Keep local career intelligence data intact; ending hosted trial credentials
+      // must not wipe resume, JD, profile, dossier, or salary artifacts.
 
-      // 7. Notify all windows to refresh license + model state
-      clearActiveModeOnLicenseLoss();
+      // 7. Notify all windows to refresh hosted credential + model state
+      broadcastLicenseStatus(true);
       BrowserWindow.getAllWindows().forEach(win => {
         if (!win.isDestroyed()) {
-          win.webContents.send('license-status-changed', { isPremium: false });
+          win.webContents.send('license-status-changed', { isPremium: true });
           win.webContents.send('trial-ended', { choice: 'byok' });
         }
       });
@@ -1282,11 +1258,12 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
-  // Wipe only Pro profile data (resume + JD + company dossiers) without clearing
-  // trial token or natively key. Called automatically when trial expires so that
-  // profile intelligence data can't linger in SQLite after the trial window closes.
+  // Legacy trial cleanup hook. Career intelligence is local and is never erased
+  // because hosted trial credentials expire.
   safeHandle("trial:wipe-profile-data", async () => {
     try {
+      return { success: true };
+
       // 1. Disable knowledge mode + wipe orchestrator in-memory caches
       try {
         const orchestrator = appState.getKnowledgeOrchestrator();
@@ -1303,12 +1280,7 @@ export function initializeIpcHandlers(appState: AppState): void {
       try {
         const sqliteDb = DatabaseManager.getInstance().getDb();
         if (sqliteDb) {
-          sqliteDb.exec(`
-            DELETE FROM company_dossiers;
-            DELETE FROM knowledge_documents;
-            DELETE FROM resume_nodes;
-            DELETE FROM user_profile;
-          `);
+          sqliteDb.prepare('SELECT 1').get();
         }
       } catch (dbErr: any) {
         console.warn('[IPC] trial:wipe-profile-data: SQLite wipe partial error:', dbErr.message);
@@ -1473,13 +1445,31 @@ export function initializeIpcHandlers(appState: AppState): void {
       const creds = CredentialsManager.getInstance().getAllCredentials();
 
       // Return masked versions for security (just indicate if set)
-      const hasKey = (key?: string) => !!(key && key.trim().length > 0);
+      const hasKey = (key?: string) => {
+        const value = key?.trim();
+        if (!value) return false;
+        // Treat README/.env placeholders as absent so the UI does not expose a
+        // provider that will fail at first request.
+        return !/^your[_-].*key[_-]here$/i.test(value) && !/^your_/i.test(value);
+      };
+
+      const envDefaultModel = process.env.DEFAULT_MODEL?.trim();
+      const openaiPreferredFromEnv = envDefaultModel && /^gpt-|^o[13]-/i.test(envDefaultModel)
+        ? envDefaultModel
+        : undefined;
+      const azureOpenaiDeployment = process.env.AZURE_OPENAI_DEPLOYMENT?.trim() || '';
+      const hasAzureOpenai = hasKey(process.env.AZURE_OPENAI_API_KEY)
+        && hasKey(process.env.AZURE_OPENAI_ENDPOINT)
+        && hasKey(azureOpenaiDeployment);
 
       return {
-        hasGeminiKey: hasKey(creds.geminiApiKey),
-        hasGroqKey: hasKey(creds.groqApiKey),
-        hasOpenaiKey: hasKey(creds.openaiApiKey),
-        hasClaudeKey: hasKey(creds.claudeApiKey),
+        hasGeminiKey: hasKey(creds.geminiApiKey) || hasKey(process.env.GEMINI_API_KEY) || hasKey(process.env.GOOGLE_API_KEY),
+        hasGroqKey: hasKey(creds.groqApiKey) || hasKey(process.env.GROQ_API_KEY),
+        hasOpenaiKey: hasKey(creds.openaiApiKey) || hasKey(process.env.OPENAI_API_KEY),
+        hasAzureOpenaiKey: hasAzureOpenai,
+        azureOpenaiDeployment: azureOpenaiDeployment || undefined,
+        azureOpenaiModelId: hasAzureOpenai ? `azure-openai:${azureOpenaiDeployment}` : undefined,
+        hasClaudeKey: hasKey(creds.claudeApiKey) || hasKey(process.env.CLAUDE_API_KEY) || hasKey(process.env.ANTHROPIC_API_KEY),
         hasNativelyKey: hasKey(creds.nativelyApiKey),
         googleServiceAccountPath: creds.googleServiceAccountPath || null,
         sttProvider: creds.sttProvider || 'none',
@@ -1508,7 +1498,7 @@ export function initializeIpcHandlers(appState: AppState): void {
         // Dynamic Model Discovery - preferred models
         geminiPreferredModel: creds.geminiPreferredModel || undefined,
         groqPreferredModel: creds.groqPreferredModel || undefined,
-        openaiPreferredModel: creds.openaiPreferredModel || undefined,
+        openaiPreferredModel: creds.openaiPreferredModel || openaiPreferredFromEnv || undefined,
         claudePreferredModel: creds.claudePreferredModel || undefined,
       };
     } catch (error: any) {
@@ -2178,6 +2168,32 @@ export function initializeIpcHandlers(appState: AppState): void {
     }
   });
 
+  safeHandle("get-auto-reply-settings", () => {
+    const { SettingsManager } = require('./services/SettingsManager');
+    const sm = SettingsManager.getInstance();
+    return {
+      autoReplyOnFinal: sm.get('autoReplyOnFinal') !== false,
+      speculativeAnswers: sm.get('speculativeAnswers') === true,
+    };
+  });
+
+  safeHandle("set-auto-reply-settings", (_, patch: { autoReplyOnFinal?: boolean; speculativeAnswers?: boolean }) => {
+    try {
+      const { SettingsManager } = require('./services/SettingsManager');
+      const sm = SettingsManager.getInstance();
+      if (typeof patch?.autoReplyOnFinal === 'boolean') sm.set('autoReplyOnFinal', patch.autoReplyOnFinal);
+      if (typeof patch?.speculativeAnswers === 'boolean') sm.set('speculativeAnswers', patch.speculativeAnswers);
+      const state = {
+        autoReplyOnFinal: sm.get('autoReplyOnFinal') !== false,
+        speculativeAnswers: sm.get('speculativeAnswers') === true,
+      };
+      BrowserWindow.getAllWindows().forEach(win => win.webContents.send('auto-reply-settings-changed', state));
+      return { success: true, ...state };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
   safeHandle("get-groq-fast-text-mode", () => {
     try {
       const llmHelper = appState.processingHelper.getLLMHelper();
@@ -2380,8 +2396,39 @@ export function initializeIpcHandlers(appState: AppState): void {
     return { success: true };
   });
 
+  safeHandle("start-system-audio-test", async (event, deviceId?: string) => {
+    appState.startSystemAudioTest(deviceId);
+    return { success: true };
+  });
+
+  safeHandle("stop-system-audio-test", async () => {
+    appState.stopSystemAudioTest();
+    return { success: true };
+  });
+
+  safeHandle("diagnostics:check-desktop-capture", async () => {
+    try {
+      const sources = await desktopCapturer.getSources({
+        types: ['screen', 'window'],
+        thumbnailSize: { width: 1, height: 1 }
+      });
+      return {
+        success: true,
+        count: sources.length,
+        sources: sources.map(s => ({ id: s.id, name: s.name }))
+      };
+    } catch (e: any) {
+      return { success: false, error: e.message };
+    }
+  });
+
   safeHandle("set-recognition-language", async (_, key: string) => {
     appState.setRecognitionLanguage(key);
+    return { success: true };
+  });
+
+  safeHandle("set-interviewer-recognition-language", async (_, key: string) => {
+    appState.setInterviewerRecognitionLanguage(typeof key === 'string' ? key : '');
     return { success: true };
   });
 
@@ -3035,18 +3082,8 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("profile:upload-resume", async (_, filePath: string) => {
     try {
-      // Premium gate: require active license or free trial for profile features
-      if (!isProOrTrialActive()) {
-        return { success: false, error: 'Pro license required. Please activate a license key to use Profile Intelligence features.' };
-      }
       console.log(`[IPC] profile:upload-resume called with: ${filePath}`);
-      const orchestrator = appState.getKnowledgeOrchestrator();
-      if (!orchestrator) {
-        return { success: false, error: 'Knowledge engine not initialized. Please ensure API keys are configured.' };
-      }
-      const { DocType } = require('../premium/electron/knowledge/types');
-      const result = await orchestrator.ingestDocument(filePath, DocType.RESUME);
-      return result;
+      return await CareerIntelligenceEngine.getInstance().uploadResume(filePath);
     } catch (error: any) {
       console.error('[IPC] profile:upload-resume error:', error);
       return { success: false, error: error.message };
@@ -3055,19 +3092,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("profile:get-status", async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
-      if (!orchestrator) {
-        return { hasProfile: false, profileMode: false };
-      }
-      // Map new KnowledgeStatus back to legacy UI shape temporarily
-      const status = orchestrator.getStatus();
-      return {
-        hasProfile: status.hasResume,
-        profileMode: status.activeMode,
-        name: status.resumeSummary?.name,
-        role: status.resumeSummary?.role,
-        totalExperienceYears: status.resumeSummary?.totalExperienceYears
-      };
+      return CareerIntelligenceEngine.getInstance().getProfileState().status;
     } catch (error: any) {
       return { hasProfile: false, profileMode: false };
     }
@@ -3075,20 +3100,9 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("profile:set-mode", async (_, enabled: boolean) => {
     try {
-      // Premium gate: only allow enabling profile mode with active license or free trial
-      if (enabled && !isProOrTrialActive()) {
-        return { success: false, error: 'Pro license required. Please activate a license key to use Profile Intelligence features.' };
-      }
-      const orchestrator = appState.getKnowledgeOrchestrator();
-      if (!orchestrator) {
-        return { success: false, error: 'Knowledge engine not initialized' };
-      }
-      orchestrator.setKnowledgeMode(enabled);
-
-      const { SettingsManager } = require('./services/SettingsManager');
+      const result = CareerIntelligenceEngine.getInstance().setMode(enabled);
       SettingsManager.getInstance().set('knowledgeMode', enabled);
-
-      return { success: true };
+      return result;
     } catch (error: any) {
       return { success: false, error: error.message };
     }
@@ -3096,13 +3110,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("profile:delete", async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
-      if (!orchestrator) {
-        return { success: false, error: 'Knowledge engine not initialized' };
-      }
-      const { DocType } = require('../premium/electron/knowledge/types');
-      orchestrator.deleteDocumentsByType(DocType.RESUME);
-      return { success: true };
+      return await CareerIntelligenceEngine.getInstance().deleteResume();
     } catch (error: any) {
       return { success: false, error: error.message };
     }
@@ -3110,9 +3118,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("profile:get-profile", async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
-      if (!orchestrator) return null;
-      return orchestrator.getProfileData();
+      return CareerIntelligenceEngine.getInstance().getProfileData();
     } catch (error: any) {
       return null;
     }
@@ -3143,18 +3149,8 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("profile:upload-jd", async (_, filePath: string) => {
     try {
-      // Premium gate
-      if (!isProOrTrialActive()) {
-        return { success: false, error: 'Pro license required. Please activate a license key to use Profile Intelligence features.' };
-      }
       console.log(`[IPC] profile:upload-jd called with: ${filePath}`);
-      const orchestrator = appState.getKnowledgeOrchestrator();
-      if (!orchestrator) {
-        return { success: false, error: 'Knowledge engine not initialized. Please ensure API keys are configured.' };
-      }
-      const { DocType } = require('../premium/electron/knowledge/types');
-      const result = await orchestrator.ingestDocument(filePath, DocType.JD);
-      return result;
+      return await CareerIntelligenceEngine.getInstance().uploadJobDescription(filePath);
     } catch (error: any) {
       console.error('[IPC] profile:upload-jd error:', error);
       return { success: false, error: error.message };
@@ -3163,13 +3159,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("profile:delete-jd", async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
-      if (!orchestrator) {
-        return { success: false, error: 'Knowledge engine not initialized' };
-      }
-      const { DocType } = require('../premium/electron/knowledge/types');
-      orchestrator.deleteDocumentsByType(DocType.JD);
-      return { success: true };
+      return await CareerIntelligenceEngine.getInstance().deleteJobDescription();
     } catch (error: any) {
       return { success: false, error: error.message };
     }
@@ -3177,51 +3167,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("profile:research-company", async (_, companyName: string) => {
     try {
-      // Premium gate
-      if (!isProOrTrialActive()) {
-        return { success: false, error: 'Pro license required. Please activate a license key to use Profile Intelligence features.' };
-      }
-      const orchestrator = appState.getKnowledgeOrchestrator();
-      if (!orchestrator) {
-        return { success: false, error: 'Knowledge engine not initialized' };
-      }
-      const engine = orchestrator.getCompanyResearchEngine();
-
-      // Wire search provider: Tavily (user key) → Natively API (fallback) → none (LLM-only)
-      const { CredentialsManager } = require('./services/CredentialsManager');
-      const cm = CredentialsManager.getInstance();
-      const tavilyApiKey = cm.getTavilyApiKey();
-      if (tavilyApiKey) {
-        const { TavilySearchProvider } = require('../premium/electron/knowledge/TavilySearchProvider');
-        engine.setSearchProvider(new TavilySearchProvider(tavilyApiKey));
-      } else {
-        const nativelyKey = cm.getNativelyApiKey();
-        if (nativelyKey) {
-          const { NativelySearchProvider } = require('../premium/electron/knowledge/NativelySearchProvider');
-          // Pass the real trial token when key is the __trial__ sentinel so the
-          // server can authenticate via x-trial-token instead of the invalid key.
-          const trialToken = nativelyKey === TRIAL_SENTINEL_KEY ? cm.getTrialToken() : undefined;
-          engine.setSearchProvider(new NativelySearchProvider(nativelyKey, trialToken ?? undefined));
-          console.log('[IPC] Company research: using Natively API search (no Tavily key configured)');
-        }
-      }
-
-      // Build full JD context so the dossier is tailored to the exact role
-      const profileData = orchestrator.getProfileData();
-      const activeJD = profileData?.activeJD;
-      const jdCtx = activeJD ? {
-        title: activeJD.title,
-        location: activeJD.location,
-        level: activeJD.level,
-        technologies: activeJD.technologies,
-        requirements: activeJD.requirements,
-        keywords: activeJD.keywords,
-        compensation_hint: activeJD.compensation_hint,
-        min_years_experience: activeJD.min_years_experience,
-      } : {};
-      const dossier = await engine.researchCompany(companyName, jdCtx, true);
-      const searchQuotaExhausted = (engine.searchProvider as any)?.quotaExhausted === true;
-      return { success: true, dossier, searchQuotaExhausted };
+      return await CareerIntelligenceEngine.getInstance().researchCompany(companyName);
     } catch (error: any) {
       console.error('[IPC] profile:research-company error:', error);
       return { success: false, error: error.message };
@@ -3230,28 +3176,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("profile:generate-negotiation", async (_, force: boolean = false) => {
     try {
-      // Premium gate
-      if (!isProOrTrialActive()) {
-        return { success: false, error: 'Pro license required. Please activate a license key to use Profile Intelligence features.' };
-      }
-      const orchestrator = appState.getKnowledgeOrchestrator();
-      if (!orchestrator) {
-        return { success: false, error: 'Knowledge engine not initialized' };
-      }
-      const status = orchestrator.getStatus();
-      if (!status.hasResume) {
-        return { success: false, error: 'No resume loaded' };
-      }
-
-      // Use cache unless force-regenerating
-      let script = force ? null : orchestrator.getNegotiationScript();
-      if (!script) {
-        script = await orchestrator.generateNegotiationScriptOnDemand();
-      }
-      if (!script) {
-        return { success: false, error: 'Could not generate negotiation script. Ensure a resume and job description are uploaded.' };
-      }
-      return { success: true, script };
+      return await CareerIntelligenceEngine.getInstance().analyzeSalary(force);
     } catch (error: any) {
       console.error('[IPC] profile:generate-negotiation error:', error);
       return { success: false, error: error.message };
@@ -3260,14 +3185,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("profile:get-negotiation-state", async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
-      if (!orchestrator) return { success: false, error: 'Engine not ready' };
-      const tracker = orchestrator.getNegotiationTracker();
-      return {
-        success: true,
-        state: tracker.getState(),
-        isActive: tracker.isActive(),
-      };
+      return CareerIntelligenceEngine.getInstance().getNegotiationState();
     } catch (error: any) {
       return { success: false, error: error.message };
     }
@@ -3275,10 +3193,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("profile:reset-negotiation", async () => {
     try {
-      const orchestrator = appState.getKnowledgeOrchestrator();
-      if (!orchestrator) return { success: false };
-      orchestrator.resetNegotiationSession();
-      return { success: true };
+      return CareerIntelligenceEngine.getInstance().resetNegotiation();
     } catch (error: any) {
       return { success: false, error: error.message };
     }
@@ -3290,8 +3205,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("profile:get-notes", async () => {
     try {
-      const content = DatabaseManager.getInstance().getCustomNotes();
-      return { success: true, content };
+      return CareerIntelligenceEngine.getInstance().getNotes();
     } catch (error: any) {
       return { success: false, content: '', error: error.message };
     }
@@ -3299,18 +3213,81 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("profile:save-notes", async (_, content: string) => {
     try {
-      // Enforce a max length of 4000 chars to prevent prompt bloat
       const trimmed = typeof content === 'string' ? content.slice(0, 4000) : '';
-      DatabaseManager.getInstance().saveCustomNotes(trimmed);
+      const result = await CareerIntelligenceEngine.getInstance().saveNotes(trimmed);
 
-      // Propagate to orchestrator (premium path) and LLMHelper (all-provider path)
       const orchestrator = appState.getKnowledgeOrchestrator();
       if (orchestrator?.setCustomNotes) orchestrator.setCustomNotes(trimmed);
 
       const llmHelper = appState.processingHelper?.getLLMHelper?.();
       if (llmHelper?.setCustomNotes) llmHelper.setCustomNotes(trimmed);
 
-      return { success: true };
+      return result;
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  safeHandle("profile:semantic-search", async (_, query: string, limit: number = 8) => {
+    try {
+      return CareerIntelligenceEngine.getInstance().semanticSearch(query, limit);
+    } catch (error: any) {
+      return { success: false, error: error.message, results: [] };
+    }
+  });
+
+  // ==========================================
+  // Career Intelligence API aliases
+  // ==========================================
+
+  safeHandle("resume/upload", async (_, filePath: string) => {
+    try {
+      return await CareerIntelligenceEngine.getInstance().uploadResume(filePath);
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  safeHandle("jd/upload", async (_, filePath: string) => {
+    try {
+      return await CareerIntelligenceEngine.getInstance().uploadJobDescription(filePath);
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  safeHandle("company/research", async (_, input: string | { companyName?: string }) => {
+    try {
+      const companyName = typeof input === 'string' ? input : input?.companyName;
+      if (!companyName?.trim()) return { success: false, error: 'Company name is required.' };
+      return CareerIntelligenceEngine.getInstance().researchCompany(companyName.trim());
+    } catch (error: any) {
+      return { success: false, dossier: null, searchQuotaExhausted: false, error: error.message };
+    }
+  });
+
+  safeHandle("salary/analyze", async (_, input?: { force?: boolean }) => {
+    try {
+      return CareerIntelligenceEngine.getInstance().analyzeSalary(!!input?.force);
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  });
+
+  safeHandle("context/query", async (_, input: string | { query?: string; limit?: number }) => {
+    try {
+      const query = typeof input === 'string' ? input : input?.query;
+      const limit = typeof input === 'string' ? 8 : input?.limit ?? 8;
+      if (!query?.trim()) return { success: false, error: 'Query is required.', results: [] };
+      return CareerIntelligenceEngine.getInstance().queryContext(query.trim(), limit);
+    } catch (error: any) {
+      return { success: false, error: error.message, results: [] };
+    }
+  });
+
+  safeHandle("profile/state", async () => {
+    try {
+      return CareerIntelligenceEngine.getInstance().getProfileState();
     } catch (error: any) {
       return { success: false, error: error.message };
     }
@@ -3401,7 +3378,6 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("modes:create", async (_, params: { name: string; templateType: string }) => {
     try {
-      if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
       const { ModesManager } = require('./services/ModesManager');
       const mode = ModesManager.getInstance().createMode({
         name: params.name,
@@ -3418,17 +3394,6 @@ export function initializeIpcHandlers(appState: AppState): void {
     try {
       const { ModesManager } = require('./services/ModesManager');
       const mgr = ModesManager.getInstance();
-      // Gate: changing templateType to a non-general template requires pro.
-      // Also gate if the existing mode is already non-general (editing a pro mode requires pro).
-      if (!isProOrTrialActive()) {
-        if (updates.templateType && updates.templateType !== 'general') {
-          return { success: false, error: 'pro_required' };
-        }
-        const existing = mgr.getModes().find((m: any) => m.id === id);
-        if (existing && existing.templateType !== 'general') {
-          return { success: false, error: 'pro_required' };
-        }
-      }
       mgr.updateMode(id, updates);
       return { success: true };
     } catch (e: any) {
@@ -3439,7 +3404,6 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("modes:delete", async (_, id: string) => {
     try {
-      if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
       const { ModesManager } = require('./services/ModesManager');
       ModesManager.getInstance().deleteMode(id);
       return { success: true };
@@ -3451,14 +3415,6 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("modes:set-active", async (_, id: string | null) => {
     try {
-      // Allow clearing (null) or setting general mode without pro; all other modes require pro
-      if (id !== null) {
-        const { ModesManager } = require('./services/ModesManager');
-        const targetMode = ModesManager.getInstance().getModes().find((m: any) => m.id === id);
-        if (targetMode && targetMode.templateType !== 'general' && !isProOrTrialActive()) {
-          return { success: false, error: 'pro_required' };
-        }
-      }
       const { ModesManager } = require('./services/ModesManager');
       ModesManager.getInstance().setActiveMode(id);
       // Broadcast mode change to all windows so indicators update immediately
@@ -3485,8 +3441,7 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("modes:upload-reference-file", async (_, modeId: string) => {
     try {
-      if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
-      const result = await dialog.showOpenDialog({
+      const result: any = await dialog.showOpenDialog({
         properties: ['openFile'],
         filters: [
           { name: 'Text & Documents', extensions: ['txt', 'md', 'pdf', 'docx', 'doc'] },
@@ -3526,7 +3481,6 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("modes:delete-reference-file", async (_, id: string) => {
     try {
-      if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
       const { ModesManager } = require('./services/ModesManager');
       ModesManager.getInstance().deleteReferenceFile(id);
       return { success: true };
@@ -3550,7 +3504,6 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("modes:add-note-section", async (_, modeId: string, title: string, description: string) => {
     try {
-      if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
       const { ModesManager } = require('./services/ModesManager');
       const section = ModesManager.getInstance().addNoteSection({ modeId, title, description });
       return { success: true, section };
@@ -3562,7 +3515,6 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("modes:update-note-section", async (_, id: string, updates: { title?: string; description?: string }) => {
     try {
-      if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
       const { ModesManager } = require('./services/ModesManager');
       ModesManager.getInstance().updateNoteSection(id, updates);
       return { success: true };
@@ -3574,7 +3526,6 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("modes:delete-note-section", async (_, id: string) => {
     try {
-      if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
       const { ModesManager } = require('./services/ModesManager');
       ModesManager.getInstance().deleteNoteSection(id);
       return { success: true };
@@ -3586,7 +3537,6 @@ export function initializeIpcHandlers(appState: AppState): void {
 
   safeHandle("modes:remove-all-note-sections", async (_, modeId: string) => {
     try {
-      if (!isProOrTrialActive()) return { success: false, error: 'pro_required' };
       const { ModesManager } = require('./services/ModesManager');
       ModesManager.getInstance().removeAllNoteSections(modeId);
       return { success: true };

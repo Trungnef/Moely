@@ -14,6 +14,13 @@ const isDev = process.env.NODE_ENV === "development"
 const isDevTest = process.env.IS_DEV_TEST === "true"
 const MOCK_API_WAIT_TIME = Number(process.env.MOCK_API_WAIT_TIME) || 500
 
+const realEnvValue = (value?: string): string | undefined => {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  if (/^your[_-].*key[_-]here$/i.test(trimmed) || /^your_/i.test(trimmed)) return undefined;
+  return trimmed;
+}
+
 export class ProcessingHelper {
   private appState: AppState
   private llmHelper: LLMHelper
@@ -33,10 +40,10 @@ export class ProcessingHelper {
       this.llmHelper = new LLMHelper(undefined, true, ollamaModel, ollamaUrl)
     } else {
       // Try environment first (for development)
-      let apiKey = process.env.GEMINI_API_KEY
-      let groqApiKey = process.env.GROQ_API_KEY
-      let openaiApiKey = process.env.OPENAI_API_KEY
-      let claudeApiKey = process.env.CLAUDE_API_KEY
+      let apiKey = realEnvValue(process.env.GEMINI_API_KEY)
+      let groqApiKey = realEnvValue(process.env.GROQ_API_KEY)
+      let openaiApiKey = realEnvValue(process.env.OPENAI_API_KEY)
+      let claudeApiKey = realEnvValue(process.env.CLAUDE_API_KEY)
 
       // Allow initializing without key (will be loaded in loadStoredCredentials or via Settings)
       if (!apiKey) {

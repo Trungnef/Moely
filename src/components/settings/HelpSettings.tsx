@@ -932,8 +932,14 @@ export const HelpSettings: React.FC<{ onNavigate?: (tab: string) => void }> = ({
 
                 <AccordionSection title="1. App Permissions Setup" icon={<Monitor className="w-4 h-4" />}>
                     <div className="space-y-4">
-                        <p>Natively operates entirely on-device, but requires OS permissions to tap into your screen context and global keystrokes. Here is how your system should look:</p>
-                        <MockPermissionsAnim />
+                        {((window as any).electronAPI?.platform ?? 'darwin') === 'darwin' ? (
+                            <>
+                                <p>Natively operates entirely on-device, but requires OS permissions to tap into your screen context and global keystrokes. Here is how your system should look:</p>
+                                <MockPermissionsAnim />
+                            </>
+                        ) : (
+                            <p>Natively operates entirely on-device. On Windows, permissions for Microphone access are managed in Windows Settings under Privacy & Security. Desktop audio and screen capture do not require special OS-level permissions but do require access to the desktop capture sources.</p>
+                        )}
                         <div className="space-y-3 mt-4">
                             <h4 className="font-bold text-base text-text-primary border-b border-border-subtle pb-2">Hardware & Engine Configurations</h4>
 
@@ -946,24 +952,45 @@ export const HelpSettings: React.FC<{ onNavigate?: (tab: string) => void }> = ({
                                 </p>
                             </div>
 
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                                <div className={`p-4 rounded-xl border bg-bg-item-surface border-border-subtle space-y-2`}>
-                                    <h5 className={`font-semibold text-[13px] text-text-primary flex items-center gap-2`}>
-                                        <Monitor size={14} className="text-accent-primary" /> ScreenCaptureKit (SCK)
-                                    </h5>
-                                    <p className="text-[11px] opacity-90 leading-relaxed text-text-secondary">
-                                        The recommended backend for macOS 13.0+. Uses Apple's modern, highly optimized internal framework for 0-latency loopback speaker capture securely.
-                                    </p>
+                            {((window as any).electronAPI?.platform ?? 'darwin') === 'darwin' ? (
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                    <div className={`p-4 rounded-xl border bg-bg-item-surface border-border-subtle space-y-2`}>
+                                        <h5 className={`font-semibold text-[13px] text-text-primary flex items-center gap-2`}>
+                                            <Monitor size={14} className="text-accent-primary" /> ScreenCaptureKit (SCK)
+                                        </h5>
+                                        <p className="text-[11px] opacity-90 leading-relaxed text-text-secondary">
+                                            The recommended backend for macOS 13.0+. Uses Apple's modern, highly optimized internal framework for 0-latency loopback speaker capture securely.
+                                        </p>
+                                    </div>
+                                    <div className={`p-4 rounded-xl border bg-bg-item-surface border-border-subtle space-y-2`}>
+                                        <h5 className={`font-semibold text-[13px] text-text-primary flex items-center gap-2`}>
+                                            <Volume2 size={14} className="text-orange-500" /> CoreAudio (Legacy)
+                                        </h5>
+                                        <p className="text-[11px] opacity-90 leading-relaxed text-text-secondary">
+                                            Fallback engine for older hardware. Relies on internal device aggregation to trap output audio. Only use this if SCK repeatedly drops speaker packets.
+                                        </p>
+                                    </div>
                                 </div>
-                                <div className={`p-4 rounded-xl border bg-bg-item-surface border-border-subtle space-y-2`}>
-                                    <h5 className={`font-semibold text-[13px] text-text-primary flex items-center gap-2`}>
-                                        <Volume2 size={14} className="text-orange-500" /> CoreAudio (Legacy)
-                                    </h5>
-                                    <p className="text-[11px] opacity-90 leading-relaxed text-text-secondary">
-                                        Fallback engine for older hardware. Relies on internal device aggregation to trap output audio. Only use this if SCK repeatedly drops speaker packets.
-                                    </p>
+                            ) : (
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                    <div className={`p-4 rounded-xl border bg-bg-item-surface border-border-subtle space-y-2`}>
+                                        <h5 className={`font-semibold text-[13px] text-text-primary flex items-center gap-2`}>
+                                            <Monitor size={14} className="text-accent-primary" /> WASAPI Loopback Capture
+                                        </h5>
+                                        <p className="text-[11px] opacity-90 leading-relaxed text-text-secondary">
+                                            The standard capture backend for Windows. Taps into the Windows Audio Session API to capture loopback speaker audio natively without requiring separate virtual drivers.
+                                        </p>
+                                    </div>
+                                    <div className={`p-4 rounded-xl border bg-bg-item-surface border-border-subtle space-y-2`}>
+                                        <h5 className={`font-semibold text-[13px] text-text-primary flex items-center gap-2`}>
+                                            <Globe size={14} className="text-orange-500" /> desktopCapturer API
+                                        </h5>
+                                        <p className="text-[11px] opacity-90 leading-relaxed text-text-secondary">
+                                            Electron's internal screen sharing query tool. Enumerates screens and windows for screenshot capture. Verification ensures correct display bounding.
+                                        </p>
+                                    </div>
                                 </div>
-                            </div>
+                            )}
 
                             <div className={`p-4 rounded-xl border bg-bg-item-surface border-border-subtle space-y-2`}>
                                 <h5 className={`font-semibold text-[13px] text-text-primary flex items-center gap-2`}>

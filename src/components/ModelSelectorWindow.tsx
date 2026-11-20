@@ -80,6 +80,15 @@ const ModelSelectorWindow = () => {
                     models.push({ id: 'natively', name: 'Natively API', type: 'cloud', provider: 'natively' });
                 }
 
+                if (creds?.hasAzureOpenaiKey && creds?.azureOpenaiDeployment) {
+                    models.push({
+                        id: creds.azureOpenaiModelId || `azure-openai:${creds.azureOpenaiDeployment}`,
+                        name: `Azure OpenAI (${prettifyModelId(creds.azureOpenaiDeployment)})`,
+                        type: 'cloud',
+                        provider: 'azure-openai',
+                    });
+                }
+
                 // Cloud Models — standard models + unique preferred models
                 for (const [prov, cfg] of Object.entries(STANDARD_CLOUD_MODELS)) {
                     if (!cfg.hasKeyCheck(creds)) continue;
@@ -111,15 +120,22 @@ const ModelSelectorWindow = () => {
                     models.push({ id: `ollama-${m}`, name: `${m} (Local)`, type: 'ollama' });
                 });
 
-                localStorage.setItem('cached-models', JSON.stringify(models));
-                setAvailableModels(models);
-
                 // 4. Get Current Active Model
                 const config = await window.electronAPI?.getCurrentLlmConfig?.(); // Get runtime model
+                let finalModels = models;
                 if (config && config.model) {
+                    if (!finalModels.some(model => model.id === config.model)) {
+                        finalModels = [
+                            { id: config.model, name: prettifyModelId(config.model), type: 'cloud', provider: 'active' },
+                            ...finalModels,
+                        ];
+                    }
                     setCurrentModel(config.model);
                     localStorage.setItem('cached-current-model', config.model);
                 }
+
+                localStorage.setItem('cached-models', JSON.stringify(finalModels));
+                setAvailableModels(finalModels);
 
             } catch (err) {
                 console.error("Failed to load models:", err);

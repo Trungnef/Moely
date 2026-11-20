@@ -101,7 +101,31 @@ export class IntelligenceEngine extends EventEmitter {
     private readonly SPECULATIVE_DEBOUNCE_MS = 350;
     private readonly SPECULATIVE_MIN_WORDS = 7;
     private readonly SPECULATIVE_MIN_CONFIDENCE = 0.75;
-    private readonly SPECULATIVE_SIMILARITY_THRESHOLD = 0.75;
+    private readonly SPECULATIVE_SIMILARITY_THRESHOLD = 0.8;
+    // How long a completed speculative answer stays eligible to be reused by the end-of-turn trigger
+    private readonly SPECULATIVE_REUSE_WINDOW_MS = 15000;
+
+    // End-of-turn detection: interviewer finals are aggregated into one question and
+    // auto-answered once the interviewer stops talking.
+    private turnFinals: string[] = [];
+    private turnConfidences: number[] = [];
+    private turnTimer: ReturnType<typeof setTimeout> | null = null;
+    private lastUserSpeechTime = 0;
+    private lastAutoQuestion = '';
+    private lastAutoQuestionTime = 0;
+    // Silence after the last interviewer final before we call the turn finished
+    // (providers without endpoint events: Google, REST, local Whisper, ...).
+    private readonly END_OF_TURN_SILENCE_MS = 1200;
+    // Shorter grace when the provider already reported trailing silence (speech_final).
+    private readonly END_OF_TURN_AFTER_SPEECH_FINAL_MS = 700;
+    // Don't auto-answer while the user is already talking (barge-in / answering).
+    private readonly USER_SPEAKING_SUPPRESS_MS = 1500;
+    private readonly AUTO_ANSWER_MIN_WORDS = 3;
+    private readonly AUTO_ANSWER_DEDUPE_MS = 20000;
+
+    // The what-to-say answer currently streaming into the UI, so a newer generation
+    // can close its bubble before streaming its own tokens (otherwise they merge).
+    private streamingAnswer: { gen: number; text: string } | null = null;
 
     constructor(llmHelper: LLMHelper, session: SessionTracker) {
         super();
@@ -158,33 +182,54 @@ export class IntelligenceEngine extends EventEmitter {
     // ============================================
 
     private static wordsOf(text: string): Set<string> {
-        return new Set(text.toLowerCase().match(/\b\w+\b/g) ?? []);
+        // Unicode-aware so Vietnamese syllables ("giới", "thiệu") aren't split at diacritics
+        return new Set(text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
     }
 
-    // Returns a score in [0,1] that accounts for partial-to-final comparisons.
-    // Pure Jaccard underestimates similarity when the speculative text is a prefix of the final
-    // transcript (e.g., "Can you walk me through" vs. "Can you walk me through your design process?").
-    // We blend Jaccard with a containment score (what fraction of speculative words appear in final).
+    // Pure Jaccard on word sets. Deliberately NOT containment-weighted: a speculative
+    // partial like "Can you explain how you would design" is fully contained in
+    // "...design a rate limiter", yet its answer never saw "rate limiter".
     private static jaccardSimilarity(a: string, b: string): number {
         const setA = IntelligenceEngine.wordsOf(a);
         const setB = IntelligenceEngine.wordsOf(b);
         if (setA.size === 0 && setB.size === 0) return 1;
         let intersection = 0;
         setA.forEach(w => { if (setB.has(w)) intersection++; });
-        const jaccard = intersection / (setA.size + setB.size - intersection);
-        // Containment: fraction of setA (speculative/partial) covered by setB (final)
-        const containment = setA.size > 0 ? intersection / setA.size : 0;
-        return Math.max(jaccard, containment * 0.9); // weight containment slightly below pure Jaccard
+        return intersection / (setA.size + setB.size - intersection);
     }
 
     private static hasQuestionSignal(text: string): boolean {
-        if (text.trimEnd().endsWith('?')) return true;
-        return /\b(what|how|why|where|when|which|who|can you|could you|tell me|explain|describe|walk me through|talk me through)\b/i.test(text);
+        const t = text.trim();
+        if (t.includes('?')) return true;
+        if (/\b(what|how|why|where|when|which|who|whom|whose|can you|could you|would you|will you|do you|did you|have you|are you|were you|is there|are there|tell me|tell us|explain|describe|walk me through|walk us through|talk me through|talk about|give me|share|let's discuss|let's talk)\b/i.test(t)) return true;
+        // Vietnamese (no \b — JS word boundaries don't understand diacritics)
+        return /(\s(không|chưa|nhỉ|nhé|à|hả)\s*[.!]?$|gì|nào|tại sao|vì sao|thế nào|ra sao|làm sao|bao nhiêu|bao lâu|ở đâu|khi nào|hãy |kể (cho|về|lại)|giới thiệu|giải thích|mô tả|trình bày|chia sẻ|cho (tôi|mình|chị|anh|em|chúng tôi) biết|có thể|được không)/i.test(t);
+    }
+
+    private getSetting<T>(key: string, fallback: T): T {
+        try {
+            const { SettingsManager } = require('./services/SettingsManager');
+            const v = SettingsManager.getInstance().get(key);
+            return (v === undefined || v === null) ? fallback : v as T;
+        } catch {
+            return fallback; // SettingsManager unavailable (tests / before app ready)
+        }
+    }
+
+    /** Auto-answer when the interviewer finishes a question. Default ON. */
+    private isAutoReplyEnabled(): boolean {
+        return this.getSetting<boolean>('autoReplyOnFinal', true) !== false;
+    }
+
+    /** Start answering on stable interim text before the turn ends. Default OFF (can answer half a question). */
+    private isSpeculationEnabled(): boolean {
+        return this.isAutoReplyEnabled() && this.getSetting<boolean>('speculativeAnswers', false) === true;
     }
 
     // Fires speculative LLM inference on a stable high-confidence interviewer partial.
     // Debounced so rapid word-by-word partials don't spawn multiple streams.
     private maybeSpeculate(segment: TranscriptSegment): void {
+        if (!this.isSpeculationEnabled()) return;
         if (this.activeMode !== 'idle' && this.activeMode !== 'assist') return;
 
         // Snapshot values now — STT adapters may mutate the same segment object in place.
@@ -205,6 +250,13 @@ export class IntelligenceEngine extends EventEmitter {
             this.speculativeTimer = null;
             // Re-check mode: a high-priority mode may have started during the debounce window.
             if (this.activeMode !== 'idle' && this.activeMode !== 'assist') return;
+            // A completed speculative result that was never claimed by a turn-end
+            // trigger must not block speculation forever (previously it did, so
+            // speculation only ever worked once per meeting).
+            if (this.speculativeText !== null && Date.now() > this.speculativeTextExpiry) {
+                this.speculativeText = null;
+                this.speculativeTextExpiry = Infinity;
+            }
             // Don't overwrite a speculative stream that is already in flight.
             if (this.speculativeText !== null) return;
             if (Date.now() - this.lastTriggerTime < this.triggerCooldown) return;
@@ -212,6 +264,69 @@ export class IntelligenceEngine extends EventEmitter {
             this.runWhatShouldISay(text, confidence || 0.8, undefined, { speculative: true })
                 .catch(err => console.error('[IntelligenceEngine] Speculative run error:', err));
         }, this.SPECULATIVE_DEBOUNCE_MS);
+    }
+
+    // ============================================
+    // End-of-turn detection
+    // ============================================
+
+    private clearTurnTimer(): void {
+        if (this.turnTimer !== null) {
+            clearTimeout(this.turnTimer);
+            this.turnTimer = null;
+        }
+    }
+
+    private scheduleTurnEnd(delayMs: number): void {
+        this.clearTurnTimer();
+        this.turnTimer = setTimeout(() => {
+            this.turnTimer = null;
+            this.completeInterviewerTurn('silence');
+        }, delayMs);
+    }
+
+    /** Provider end-of-utterance event (Deepgram UtteranceEnd, Soniox <end>). */
+    handleUtteranceEnd(speaker: string): void {
+        if (speaker !== 'interviewer' || this.turnFinals.length === 0) return;
+        this.clearTurnTimer();
+        this.completeInterviewerTurn('utterance_end');
+    }
+
+    private completeInterviewerTurn(reason: string): void {
+        const question = this.turnFinals.join(' ').replace(/\s+/g, ' ').trim();
+        const confidences = this.turnConfidences;
+        this.turnFinals = [];
+        this.turnConfidences = [];
+        if (!question) return;
+
+        if (!this.isAutoReplyEnabled()) return;
+
+        const words = question.split(/\s+/).filter(Boolean);
+        if (words.length < this.AUTO_ANSWER_MIN_WORDS) return;
+        if (!IntelligenceEngine.hasQuestionSignal(question)) {
+            console.log(`[IntelligenceEngine] Turn ended (${reason}) without a question signal — not auto-answering: "${question.substring(0, 60)}"`);
+            return;
+        }
+        if (Date.now() - this.lastUserSpeechTime < this.USER_SPEAKING_SUPPRESS_MS) {
+            console.log('[IntelligenceEngine] Turn ended while the user is speaking — not auto-answering');
+            return;
+        }
+        // Don't interrupt explicit user-driven modes (manual chat, recap, code hint, ...)
+        if (this.activeMode !== 'idle' && this.activeMode !== 'assist' && this.activeMode !== 'what_to_say') return;
+        // Same question re-finalized / repeated within the dedupe window
+        if (Date.now() - this.lastAutoQuestionTime < this.AUTO_ANSWER_DEDUPE_MS &&
+            IntelligenceEngine.jaccardSimilarity(this.lastAutoQuestion, question) >= 0.8) {
+            return;
+        }
+        this.lastAutoQuestion = question;
+        this.lastAutoQuestionTime = Date.now();
+
+        const confidence = confidences.length
+            ? Math.max(0.5, confidences.reduce((a, b) => a + b, 0) / confidences.length)
+            : 0.8;
+        console.log(`[IntelligenceEngine] Interviewer turn complete (${reason}) — auto-answering: "${question.substring(0, 80)}"`);
+        this.handleSuggestionTrigger({ context: '', lastQuestion: question, confidence })
+            .catch(err => console.error('[IntelligenceEngine] Auto-answer error:', err));
     }
 
     /**
@@ -223,12 +338,26 @@ export class IntelligenceEngine extends EventEmitter {
 
         if (segment.speaker === 'interviewer') {
             if (!segment.final) {
+                // Interviewer is still talking — hold the turn open.
+                if (this.turnFinals.length > 0 && segment.text.trim()) this.clearTurnTimer();
                 this.maybeSpeculate(segment);
-            } else if (this.speculativeTimer !== null) {
-                // Final arrived — cancel debounce; handleSuggestionTrigger will do Jaccard check
-                clearTimeout(this.speculativeTimer);
-                this.speculativeTimer = null;
+            } else {
+                if (this.speculativeTimer !== null) {
+                    // Final arrived — cancel debounce; the turn-end trigger does the similarity check
+                    clearTimeout(this.speculativeTimer);
+                    this.speculativeTimer = null;
+                }
+                const text = segment.text.trim();
+                if (text) {
+                    this.turnFinals.push(text);
+                    this.turnConfidences.push(segment.confidence ?? 0.8);
+                    this.scheduleTurnEnd(segment.speechFinal
+                        ? this.END_OF_TURN_AFTER_SPEECH_FINAL_MS
+                        : this.END_OF_TURN_SILENCE_MS);
+                }
             }
+        } else if (segment.speaker === 'user' && segment.text.trim()) {
+            this.lastUserSpeechTime = Date.now();
         }
 
         // Check for follow-up intent if user is speaking
@@ -241,8 +370,8 @@ export class IntelligenceEngine extends EventEmitter {
     }
 
     /**
-     * Handle suggestion trigger from native audio service
-     * This is the primary auto-trigger path
+     * Auto-trigger path: called by end-of-turn detection with the aggregated
+     * interviewer question. Reuses a matching speculative answer if one exists.
      */
     async handleSuggestionTrigger(trigger: SuggestionTrigger): Promise<void> {
         if (trigger.confidence < 0.5) return;
@@ -266,12 +395,11 @@ export class IntelligenceEngine extends EventEmitter {
                 this.speculativeText = null;
                 this.speculativeTextExpiry = Infinity;
             }
-            // IMPORTANT: no await between this increment and runWhatShouldISay below —
-            // the increment must be synchronous with the new stream launch to preserve generation-id ordering.
-            ++this.currentGenerationId;
         }
 
-        await this.runWhatShouldISay(trigger.lastQuestion, trigger.confidence);
+        // The interviewer finished a new question — answer it now even if the previous
+        // answer is still streaming (runWhatShouldISay supersedes it).
+        await this.runWhatShouldISay(trigger.lastQuestion, trigger.confidence, undefined, { skipCooldown: true });
     }
 
     // ============================================
@@ -328,6 +456,21 @@ export class IntelligenceEngine extends EventEmitter {
         }
     }
 
+    // Transcript/time window used for answers. SessionTracker keeps at least this much.
+    private readonly ANSWER_CONTEXT_SECONDS = 360;
+
+    /**
+     * Close the UI bubble of an answer that is being superseded, so the next
+     * generation's tokens start a fresh bubble instead of appending to it.
+     */
+    private closeSupersededAnswer(): void {
+        const prev = this.streamingAnswer;
+        this.streamingAnswer = null;
+        if (prev && prev.text.trim()) {
+            this.emit('suggested_answer', prev.text.trimEnd() + ' …', 'superseded', 0);
+        }
+    }
+
     /**
      * MODE 2: What Should I Say (Primary)
      * Manual trigger - uses clean transcript pipeline for question inference
@@ -369,7 +512,7 @@ export class IntelligenceEngine extends EventEmitter {
                     this.setMode('idle');
                     return "Please configure your API Keys in Settings to use this feature.";
                 }
-                const context = this.session.getFormattedContext(180);
+                const context = this.session.getFormattedContext(this.ANSWER_CONTEXT_SECONDS);
                 const answer = await this.answerLLM.generate(question || '', context);
                 if (answer) {
                     this.session.addAssistantMessage(answer);
@@ -384,7 +527,12 @@ export class IntelligenceEngine extends EventEmitter {
                 return answer || "Could you repeat that? I want to make sure I address your question properly.";
             }
 
-            const contextItems = this.session.getContext(180);
+            // Claim a generation id BEFORE any await: a manual click that lands while this
+            // run is still classifying intent must supersede it, not the other way round.
+            const generationId = ++this.currentGenerationId;
+            this.closeSupersededAnswer();
+
+            const contextItems = this.session.getContext(this.ANSWER_CONTEXT_SECONDS);
 
             // Inject latest interim transcript if available
             const lastInterim = this.session.getLastInterimInterviewer();
@@ -410,45 +558,55 @@ export class IntelligenceEngine extends EventEmitter {
                 timestamp: item.timestamp
             }));
 
-            const preparedTranscript = prepareTranscriptForWhatToAnswer(transcriptTurns, 12);
+            // 20 turns ≈ the last few Q&A exchanges; older material comes in via the session summary.
+            const preparedTranscript = prepareTranscriptForWhatToAnswer(transcriptTurns, 20);
 
             const temporalContext = buildTemporalContext(
                 contextItems,
                 this.session.getAssistantResponseHistory(),
-                180
+                this.ANSWER_CONTEXT_SECONDS
             );
 
-            const lastInterviewerTurn = this.session.getLastInterviewerTurn();
+            // Classify the question being answered. For auto/speculative triggers that is
+            // the aggregated/partial text; the last *final* turn is often the previous question.
+            const intentSource = (question && question.trim()) ? question : this.session.getLastInterviewerTurn();
             const intentResult = await classifyIntent(
-                lastInterviewerTurn,
+                intentSource,
                 preparedTranscript,
                 this.session.getAssistantResponseHistory().length
             );
 
             console.log(`[IntelligenceEngine] Temporal RAG: ${temporalContext.previousResponses.length} responses, tone: ${temporalContext.toneSignals[0]?.type || 'neutral'}, intent: ${intentResult.intent}${imagePaths?.length ? `, with ${imagePaths.length} image(s)` : ''}`);
 
-            const generationId = ++this.currentGenerationId;
             let fullAnswer = "";
+            let streamAborted = this.currentGenerationId !== generationId;
+            if (!streamAborted) this.streamingAnswer = { gen: generationId, text: '' };
             // RC-03 fix: hold a reference to the generator so we can call .return()
             // to properly terminate the network request when a new generation starts.
-            const stream = this.whatToAnswerLLM.generateStream(preparedTranscript, temporalContext, intentResult, imagePaths);
-            let streamAborted = false;
+            const sessionDigest = this.session.getEarlierSessionDigest(this.ANSWER_CONTEXT_SECONDS);
+            const stream = streamAborted ? null : this.whatToAnswerLLM.generateStream(
+                preparedTranscript, temporalContext, intentResult, imagePaths, intentSource || undefined, sessionDigest
+            );
 
-            for await (const token of stream) {
-                if (this.currentGenerationId !== generationId) {
-                    console.log('[IntelligenceEngine] _what_to_say stream aborted by new generation');
-                    // RC-03 fix: .return() signals the generator to clean up and stops
-                    // the underlying network request (SDK generators honour this).
-                    await stream.return(undefined);
-                    streamAborted = true;
-                    break;
+            if (stream) {
+                for await (const token of stream) {
+                    if (this.currentGenerationId !== generationId) {
+                        console.log('[IntelligenceEngine] _what_to_say stream aborted by new generation');
+                        // RC-03 fix: .return() signals the generator to clean up and stops
+                        // the underlying network request (SDK generators honour this).
+                        await stream.return(undefined);
+                        streamAborted = true;
+                        break;
+                    }
+                    this.emit('suggested_answer_token', token, question || 'inferred', confidence);
+                    if (this.streamingAnswer?.gen === generationId) this.streamingAnswer.text += token;
+                    fullAnswer += token;
                 }
-                this.emit('suggested_answer_token', token, question || 'inferred', confidence);
-                fullAnswer += token;
             }
 
             if (streamAborted) {
-                // Aborted mid-stream — don't update session or emit final event
+                // Aborted — the newer generation already closed our UI bubble and owns
+                // the mode, so don't touch either.
                 if (isSpeculative) {
                     this.speculativeText = null;
                     this.speculativeTextExpiry = Infinity;
@@ -456,9 +614,9 @@ export class IntelligenceEngine extends EventEmitter {
                     // doesn't allow a rapid second trigger within the cooldown window.
                     this.lastTriggerTime = Date.now();
                 }
-                this.setMode('idle');
                 return null;
             }
+            if (this.streamingAnswer?.gen === generationId) this.streamingAnswer = null;
 
             if (!fullAnswer || fullAnswer.trim().length < 5) {
                 fullAnswer = "Could you repeat that? I want to make sure I address your question properly.";
@@ -482,7 +640,7 @@ export class IntelligenceEngine extends EventEmitter {
             // Set a close expiry window so speculativeText auto-clears if the trigger never arrives.
             if (isSpeculative) {
                 this.lastTriggerTime = Date.now();
-                this.speculativeTextExpiry = this.lastTriggerTime + this.triggerCooldown + 500;
+                this.speculativeTextExpiry = this.lastTriggerTime + this.SPECULATIVE_REUSE_WINDOW_MS;
             }
 
             this.setMode('idle');
@@ -490,6 +648,7 @@ export class IntelligenceEngine extends EventEmitter {
 
         } catch (error) {
             if (isSpeculative) { this.speculativeText = null; this.speculativeTextExpiry = Infinity; }
+            this.streamingAnswer = null;
             this.emit('error', error as Error, 'what_to_say');
             this.setMode('idle');
             return "Could you repeat that? I want to make sure I address your question properly.";
@@ -993,5 +1152,12 @@ export class IntelligenceEngine extends EventEmitter {
         }
         this.speculativeText = null;
         this.speculativeTextExpiry = Infinity;
+        this.clearTurnTimer();
+        this.turnFinals = [];
+        this.turnConfidences = [];
+        this.lastUserSpeechTime = 0;
+        this.lastAutoQuestion = '';
+        this.lastAutoQuestionTime = 0;
+        this.streamingAnswer = null;
     }
 }

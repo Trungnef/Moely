@@ -15,9 +15,15 @@ const { CodexCliService, DEFAULT_CODEX_CLI_CONFIG, CODEX_SANDBOX_MODES } = mod;
 
 // Mock binary that ignores all argv and sleeps 30s — used for in-flight abort/timeout tests.
 // /bin/sleep rejects codex's argv, so we need a script that swallows args.
-const MOCK_HANG_BIN = path.join(os.tmpdir(), `codex-mock-hang-${process.pid}.sh`);
+const VERSION_BIN = process.platform === 'win32' ? process.execPath : '/bin/echo';
+const MISSING_BIN = path.join(os.tmpdir(), `missing-codex-bin-${process.pid}`, process.platform === 'win32' ? 'codex.exe' : 'codex');
+const MOCK_HANG_BIN = path.join(os.tmpdir(), `codex-mock-hang-${process.pid}${process.platform === 'win32' ? '.cmd' : '.sh'}`);
 before(() => {
-  fs.writeFileSync(MOCK_HANG_BIN, '#!/bin/sh\nexec sleep 30\n', { mode: 0o755 });
+  if (process.platform === 'win32') {
+    fs.writeFileSync(MOCK_HANG_BIN, `@echo off\r\n"${process.execPath}" -e "setInterval(function(){},1000)"\r\n`, { mode: 0o755 });
+  } else {
+    fs.writeFileSync(MOCK_HANG_BIN, '#!/bin/sh\nexec sleep 30\n', { mode: 0o755 });
+  }
 });
 after(() => {
   try { fs.unlinkSync(MOCK_HANG_BIN); } catch {}
@@ -197,9 +203,9 @@ test('autoDetectPath: returns null or a real, existing executable file', () => {
 });
 
 test('validateExecutable: returns resolvedPath on success', async () => {
-  const r = await CodexCliService.validateExecutable('/bin/echo', 2000);
+  const r = await CodexCliService.validateExecutable(VERSION_BIN, 2000);
   assert.equal(r.success, true);
-  assert.equal(r.resolvedPath, '/bin/echo');
+  assert.equal(r.resolvedPath, VERSION_BIN);
 });
 
 test('validateExecutable: bare unfound name falls back to auto-detection if available', async () => {
@@ -217,14 +223,14 @@ test('validateExecutable: bare unfound name falls back to auto-detection if avai
 });
 
 test('validateExecutable: missing binary returns success=false with error string', async () => {
-  const r = await CodexCliService.validateExecutable('/nonexistent/codex-bin', 2000);
+  const r = await CodexCliService.validateExecutable(MISSING_BIN, 2000);
   assert.equal(r.success, false);
   assert.equal(typeof r.error, 'string');
   assert.ok(r.error.length > 0);
 });
 
 test('validateExecutable: real --version-capable binary returns success=true', async () => {
-  const r = await CodexCliService.validateExecutable('/bin/echo', 2000);
+  const r = await CodexCliService.validateExecutable(VERSION_BIN, 2000);
   assert.equal(r.success, true);
 });
 

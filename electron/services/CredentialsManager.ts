@@ -7,7 +7,7 @@ import { app, safeStorage } from 'electron';
 import fs from 'fs';
 import path from 'path';
 
-const CREDENTIALS_PATH = path.join(app.getPath('userData'), 'credentials.enc');
+const getCredentialsPath = (): string => path.join(app.getPath('userData'), 'credentials.enc');
 
 export interface CustomProvider {
     id: string;
@@ -48,6 +48,8 @@ export interface StoredCredentials {
     ibmWatsonRegion?: string;
     sonioxApiKey?: string;
     sttLanguage?: string;
+    // Interviewer (system audio) channel language. Empty = same as sttLanguage.
+    sttLanguageInterviewer?: string;
     aiResponseLanguage?: string;
     // Tavily Search
     tavilyApiKey?: string;
@@ -181,11 +183,21 @@ export class CredentialsManager {
         return this.credentials.sttLanguage || 'english-us';
     }
 
+    /** Raw interviewer override ('' when it follows the main STT language). */
+    public getSttLanguageInterviewerOverride(): string {
+        return this.credentials.sttLanguageInterviewer || '';
+    }
+
+    /** Effective language for the interviewer (system audio) channel. */
+    public getSttLanguageInterviewer(): string {
+        return this.credentials.sttLanguageInterviewer || this.getSttLanguage();
+    }
+
     public getAiResponseLanguage(): string {
         return this.credentials.aiResponseLanguage || 'auto';
     }
     public getDefaultModel(): string {
-        return this.credentials.defaultModel || 'gemini-3.1-flash-lite-preview';
+        return process.env.DEFAULT_MODEL || this.credentials.defaultModel || 'gemini-3.1-flash-lite-preview';
     }
 
     public getNativelyApiKey(): string | undefined {
@@ -316,6 +328,12 @@ export class CredentialsManager {
         this.credentials.sttLanguage = language;
         this.saveCredentials();
         console.log(`[CredentialsManager] STT Language set to: ${language}`);
+    }
+
+    public setSttLanguageInterviewer(language: string): void {
+        this.credentials.sttLanguageInterviewer = language || undefined;
+        this.saveCredentials();
+        console.log(`[CredentialsManager] Interviewer STT Language set to: ${language || '(same as main)'}`);
     }
 
     public setAiResponseLanguage(language: string): void {
@@ -465,10 +483,11 @@ export class CredentialsManager {
 
     public clearAll(): void {
         this.scrubMemory();
-        if (fs.existsSync(CREDENTIALS_PATH)) {
-            fs.unlinkSync(CREDENTIALS_PATH);
+        const credentialsPath = getCredentialsPath();
+        if (fs.existsSync(credentialsPath)) {
+            fs.unlinkSync(credentialsPath);
         }
-        const plaintextPath = CREDENTIALS_PATH + '.json';
+        const plaintextPath = credentialsPath + '.json';
         if (fs.existsSync(plaintextPath)) {
             fs.unlinkSync(plaintextPath);
         }
@@ -497,10 +516,11 @@ export class CredentialsManager {
 
     private saveCredentials(): void {
         try {
+            const credentialsPath = getCredentialsPath();
             if (!safeStorage.isEncryptionAvailable()) {
                 console.warn('[CredentialsManager] Encryption not available, falling back to plaintext');
                 // Fallback: save as plaintext (less secure, but functional)
-                const plainPath = CREDENTIALS_PATH + '.json';
+                const plainPath = credentialsPath + '.json';
                 const tmpPlain = plainPath + '.tmp';
                 fs.writeFileSync(tmpPlain, JSON.stringify(this.credentials));
                 fs.renameSync(tmpPlain, plainPath);
@@ -509,9 +529,9 @@ export class CredentialsManager {
 
             const data = JSON.stringify(this.credentials);
             const encrypted = safeStorage.encryptString(data);
-            const tmpEnc = CREDENTIALS_PATH + '.tmp';
+            const tmpEnc = credentialsPath + '.tmp';
             fs.writeFileSync(tmpEnc, encrypted);
-            fs.renameSync(tmpEnc, CREDENTIALS_PATH);
+            fs.renameSync(tmpEnc, credentialsPath);
         } catch (error) {
             console.error('[CredentialsManager] Failed to save credentials:', error);
         }
@@ -519,14 +539,15 @@ export class CredentialsManager {
 
     private loadCredentials(): void {
         try {
+            const credentialsPath = getCredentialsPath();
             // Try encrypted file first
-            if (fs.existsSync(CREDENTIALS_PATH)) {
+            if (fs.existsSync(credentialsPath)) {
                 if (!safeStorage.isEncryptionAvailable()) {
                     console.warn('[CredentialsManager] Encryption not available for load');
                     return;
                 }
 
-                const encrypted = fs.readFileSync(CREDENTIALS_PATH);
+                const encrypted = fs.readFileSync(credentialsPath);
                 const decrypted = safeStorage.decryptString(encrypted);
                 try {
                     const parsed = JSON.parse(decrypted);
@@ -542,7 +563,7 @@ export class CredentialsManager {
                 }
 
                 // Clean up any leftover plaintext fallback file to eliminate the data leak
-                const plaintextPath = CREDENTIALS_PATH + '.json';
+                const plaintextPath = credentialsPath + '.json';
                 if (fs.existsSync(plaintextPath)) {
                     try {
                         fs.unlinkSync(plaintextPath);
@@ -555,7 +576,7 @@ export class CredentialsManager {
             }
 
             // Fallback: try plaintext file
-            const plaintextPath = CREDENTIALS_PATH + '.json';
+            const plaintextPath = credentialsPath + '.json';
             if (fs.existsSync(plaintextPath)) {
                 const data = fs.readFileSync(plaintextPath, 'utf-8');
                 try {

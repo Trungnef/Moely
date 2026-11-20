@@ -255,7 +255,7 @@ export const PermissionsToaster: React.FC<Props> = ({ isOpen, onDismiss }) => {
                   </button>
                   {!allGranted && (
                     <p style={{ fontSize: '11px', color: T.t4, textAlign: 'center', marginTop: '10px', fontFamily: T.font }}>
-                      You can grant permissions later in System Preferences.
+                      You can grant permissions later in {platform === 'darwin' ? 'System Preferences' : 'Windows Settings'}.
                     </p>
                   )}
                 </motion.div>

@@ -59,7 +59,11 @@ export class EmbeddingPipeline {
             return this.initPromise ?? Promise.resolve();
         }
         this._lastConfig = { ...config };
-        console.log('[EmbeddingPipeline] Initializing with config:', config);
+        console.log('[EmbeddingPipeline] Initializing with config:', {
+            openaiKey: config.openaiKey ? '[set]' : undefined,
+            geminiKey: config.geminiKey ? '[set]' : undefined,
+            ollamaUrl: config.ollamaUrl,
+        });
         this.initPromise = this._doInitialize(config);
         return this.initPromise;
     }

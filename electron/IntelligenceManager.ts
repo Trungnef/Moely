@@ -134,6 +134,10 @@ export class IntelligenceManager extends EventEmitter {
         return this.engine.handleSuggestionTrigger(trigger);
     }
 
+    handleUtteranceEnd(speaker: string): void {
+        this.engine.handleUtteranceEnd(speaker);
+    }
+
     // ============================================
     // Mode Executors (delegates to engine)
     // ============================================

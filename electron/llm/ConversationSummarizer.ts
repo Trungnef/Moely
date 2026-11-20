@@ -47,7 +47,7 @@ export function compressConversation<T extends { text: string; speaker?: string;
     .map(t => t.text.slice(0, 120));
 
   // Extract facts: statements of fact, numbers, specific claims
-  const factPatterns = /(?:it('s| is) a |the (?:number|total|average|cost|price|size|scale) of|we have|there are|i('ve| have) been|we built|we launched|was (?:built|launched|deployed)/i;
+  const factPatterns = /(?:it('s| is) a |the (?:number|total|average|cost|price|size|scale) of|we have|there are|i('ve| have) been|we built|we launched|was (?:built|launched|deployed))/i;
   const facts = toCompress
     .filter(t => factPatterns.test(t.text))
     .map(t => t.text.slice(0, 120));

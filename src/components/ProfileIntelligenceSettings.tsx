@@ -1,9 +1,8 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
     X, RefreshCw, Upload, Briefcase, Trash2, Pencil, Check, Globe,
-    Building2, Search, AlertCircle, Gift, Info, Star, Sparkles, User, CheckCircle, ArrowUpRight
+    Building2, Search, AlertCircle, Gift, Info, Star, Sparkles, User, ArrowUpRight
 } from 'lucide-react';
-import { ProfileVisualizer, PremiumUpgradeModal } from '../premium';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -358,48 +357,8 @@ const StarRating = ({ value, size = 11 }: { value: number; size?: number }) => {
     );
 };
 
-// Cache premium state in localStorage so the CTA renders in its correct
-// state on first paint — avoids the "Unlock Pro" → "Manage Pro" flash for
-// activated users while the async licenseGetDetails() call is in flight.
-// Cleared whenever the canonical check returns non-premium (or on deactivate).
-const PI_PREMIUM_CACHE_KEY = 'pi:isPremium';
-const PI_PREMIUM_PLAN_CACHE_KEY = 'pi:premiumPlan';
-
-const readPremiumCache = (): { isPremium: boolean; plan: string } => {
-    if (typeof window === 'undefined') return { isPremium: false, plan: '' };
-    try {
-        return {
-            isPremium: window.localStorage.getItem(PI_PREMIUM_CACHE_KEY) === '1',
-            plan: window.localStorage.getItem(PI_PREMIUM_PLAN_CACHE_KEY) ?? '',
-        };
-    } catch {
-        return { isPremium: false, plan: '' };
-    }
-};
-
-const writePremiumCache = (isPremium: boolean, plan: string) => {
-    if (typeof window === 'undefined') return;
-    try {
-        if (isPremium) {
-            window.localStorage.setItem(PI_PREMIUM_CACHE_KEY, '1');
-            if (plan) window.localStorage.setItem(PI_PREMIUM_PLAN_CACHE_KEY, plan);
-            else window.localStorage.removeItem(PI_PREMIUM_PLAN_CACHE_KEY);
-        } else {
-            window.localStorage.removeItem(PI_PREMIUM_CACHE_KEY);
-            window.localStorage.removeItem(PI_PREMIUM_PLAN_CACHE_KEY);
-        }
-    } catch { /* localStorage disabled — fall back to live check */ }
-};
-
 export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }) {
-    // Premium Status — seed from cache so the header CTA paints correctly
-    // before licenseGetDetails() resolves.
-    const cachedPremium = readPremiumCache();
-    const [isPremium, setIsPremium] = useState(cachedPremium.isPremium);
-    const [premiumPlan, setPremiumPlan] = useState<string>(cachedPremium.plan);
-    const [isTrialActive, setIsTrialActive] = useState(false);
-    const [isPremiumModalOpen, setIsPremiumModalOpen] = useState(false);
-    const hasProfileAccess = isPremium || isTrialActive;
+    const hasProfileAccess = true;
     const isLight = useResolvedTheme() === 'light';
 
     // Profile Engine State
@@ -415,6 +374,8 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
     const [profileData, setProfileData] = useState<any>(null);
     const [jdUploading, setJdUploading] = useState(false);
     const [jdError, setJdError] = useState('');
+    const [resumeMeta, setResumeMeta] = useState<{ id?: string; filePath?: string; uploadedAt?: string } | null>(null);
+    const [jdMeta, setJdMeta] = useState<{ id?: string; filePath?: string; uploadedAt?: string } | null>(null);
     const [companyResearching, setCompanyResearching] = useState(false);
     const [companyDossier, setCompanyDossier] = useState<any>(null);
     const [companySearchQuotaExhausted, setCompanySearchQuotaExhausted] = useState(false);
@@ -428,34 +389,36 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
     const [customNotes, setCustomNotes] = useState('');
     const [customNotesSaved, setCustomNotesSaved] = useState(false);
     const customNotesDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const customNotesRef = useRef('');
+    const lastSavedCustomNotesRef = useRef('');
+    const [semanticQuery, setSemanticQuery] = useState('');
+    const [semanticResults, setSemanticResults] = useState<Array<{ category: string; title: string; snippet: string; score: number }>>([]);
+    const [semanticSearching, setSemanticSearching] = useState(false);
+    const [semanticError, setSemanticError] = useState('');
 
     useEffect(() => {
-        // Fetch premium details — canonical source of truth. Sync the
-        // localStorage cache so the next mount paints with the correct state.
-        if (window.electronAPI?.licenseGetDetails) {
-            window.electronAPI.licenseGetDetails().then((details: any) => {
-                const live = !!details?.isPremium;
-                const plan = details?.plan ?? '';
-                setIsPremium(live);
-                if (plan) setPremiumPlan(plan);
-                else if (!live) setPremiumPlan('');
-                writePremiumCache(live, plan);
+        // Proactively load career intelligence state
+        window.electronAPI?.profileState?.().then((state: any) => {
+            if (state?.status) setProfileStatus(state.status);
+            if (state?.profile) setProfileData(state.profile);
+            if (state?.negotiation) setNegotiationScript(state.negotiation);
+            if (state?.companyDossier) setCompanyDossier(state.companyDossier);
+            if (state?.resume) setResumeMeta(state.resume);
+            if (state?.jobDescription) setJdMeta(state.jobDescription);
+        }).catch(() => {
+            window.electronAPI?.profileGetStatus?.().then(setProfileStatus).catch(() => { });
+            window.electronAPI?.profileGetProfile?.().then((data: any) => setProfileData(data)).catch(() => { });
+            window.electronAPI?.profileGetNegotiationState?.().then((res: any) => {
+                if (res?.success && res.state) setNegotiationScript(res.state);
             }).catch(() => { });
-        } else {
-            window.electronAPI?.licenseCheckPremium?.().then((live: boolean) => {
-                setIsPremium(!!live);
-                writePremiumCache(!!live, premiumPlan);
-            }).catch(() => { });
-        }
-
-        // Proactively load profile data
-        window.electronAPI?.profileGetStatus?.().then(setProfileStatus).catch(() => { });
-        window.electronAPI?.profileGetProfile?.().then((data: any) => {
-            setProfileData(data);
-            if (data?.negotiationScript) setNegotiationScript(data.negotiationScript);
-        }).catch(() => { });
+        });
         window.electronAPI?.profileGetNotes?.().then((res: any) => {
-            if (res?.success) setCustomNotes(res.content ?? '');
+            if (res?.success) {
+                const content = res.content ?? res.notes ?? '';
+                setCustomNotes(content);
+                customNotesRef.current = content;
+                lastSavedCustomNotesRef.current = content;
+            }
         }).catch(() => { });
         
         // Tavily key check
@@ -464,6 +427,35 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                 setHasStoredTavilyKey(true);
             }
         }).catch(() => {});
+    }, []);
+
+    const saveCustomNotesNow = useCallback(async (value?: string) => {
+        const next = (value ?? customNotesRef.current).slice(0, 4000);
+        if (customNotesDebounceRef.current) {
+            clearTimeout(customNotesDebounceRef.current);
+            customNotesDebounceRef.current = null;
+        }
+        if (next === lastSavedCustomNotesRef.current) return;
+
+        const result = await window.electronAPI?.profileSaveNotes?.(next);
+        if (result?.success) {
+            lastSavedCustomNotesRef.current = next;
+            setCustomNotesSaved(true);
+            setTimeout(() => setCustomNotesSaved(false), 2000);
+        }
+    }, []);
+
+    useEffect(() => {
+        return () => {
+            if (customNotesDebounceRef.current) {
+                clearTimeout(customNotesDebounceRef.current);
+                customNotesDebounceRef.current = null;
+            }
+            const pending = customNotesRef.current;
+            if (pending !== lastSavedCustomNotesRef.current) {
+                window.electronAPI?.profileSaveNotes?.(pending).catch(() => { });
+            }
+        };
     }, []);
 
     const handleRemoveTavilyKey = async () => {
@@ -502,12 +494,6 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                         <div className="flex items-center gap-2.5 mb-1.5">
                             <h2 className="text-[22px] font-bold text-text-primary leading-none" style={{ letterSpacing: '-0.025em' }}>Profile Intelligence</h2>
                             <span className="pi-beta-badge">BETA</span>
-                            {isPremium && premiumPlan && (
-                                <span className="pi-meta-badge pi-meta-badge--plan">{premiumPlan} Plan</span>
-                            )}
-                            {isTrialActive && !isPremium && (
-                                <span className="pi-meta-badge pi-meta-badge--trial">Free Trial</span>
-                            )}
                         </div>
                         <p className="text-[13px] text-text-secondary" style={{ letterSpacing: '-0.005em' }}>
                             Manage your persona, career history, and active job description
@@ -515,20 +501,6 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                     </div>
                 </div>
                 <div className="flex items-center gap-3">
-                    <button
-                        onClick={() => setIsPremiumModalOpen(true)}
-                        className={`pi-cta-group${isTrialActive && !isPremium ? ' pi-cta-group--trial' : ''}`}
-                        aria-label={isPremium ? 'Manage Pro' : isTrialActive ? 'Upgrade trial' : 'Unlock Pro'}
-                    >
-                        <span>{isPremium ? 'Manage Pro' : isTrialActive ? 'Upgrade' : 'Unlock Pro'}</span>
-                        <span className="pi-cta-icon-ring">
-                            {isPremium
-                                ? <CheckCircle size={14} strokeWidth={2.5} />
-                                : isTrialActive
-                                ? <Sparkles size={14} strokeWidth={2.5} />
-                                : <ArrowUpRight size={14} strokeWidth={2.5} />}
-                        </span>
-                    </button>
                     <button
                         onClick={onClose}
                         className="pi-close-btn"
@@ -581,6 +553,7 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                                         await window.electronAPI?.profileDelete?.();
                                                                         setProfileStatus({ hasProfile: false, profileMode: false });
                                                                         setProfileData(null);
+                                                                        setResumeMeta(null);
                                                                     } catch (e) { console.error('Failed to delete profile:', e); }
                                                                 }}
                                                                 className="text-[12px] font-medium text-text-tertiary hover:text-red-500 transition-colors px-3 py-1.5 rounded-full hover:bg-red-500/10"
@@ -590,7 +563,7 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                         )}
 
                                                         {/* High-fidelity Toggle */}
-                                                        <div className={`flex items-center gap-2 bg-bg-input px-3 py-1.5 rounded-full border border-border-subtle ${!hasProfileAccess ? 'opacity-40 cursor-not-allowed' : ''}`} title={!hasProfileAccess ? 'Requires Pro license' : ''}>
+                                                        <div className="flex items-center gap-2 bg-bg-input px-3 py-1.5 rounded-full border border-border-subtle" title="Persona Engine toggle">
                                                             <span className="text-xs font-medium text-text-secondary">Persona Engine</span>
                                                             <div
                                                                 onClick={async () => {
@@ -662,6 +635,90 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                         </div>
                                     </BezelCard>
 
+                                    <BezelCard delay={0.45}>
+                                            <div className="p-5">
+                                                <div className="flex items-center gap-4 mb-4">
+                                                    <div className="w-10 h-10 rounded-lg bg-bg-input border border-border-subtle flex items-center justify-center text-blue-500 shrink-0">
+                                                        <Search size={20} />
+                                                    </div>
+                                                    <div>
+                                                        <h4 className="text-sm font-bold text-text-primary">Semantic Search</h4>
+                                                        <p className="text-[11px] text-text-secondary mt-0.5">
+                                                            Search across resume, projects, JD, and custom context.
+                                                        </p>
+                                                    </div>
+                                                </div>
+
+                                                <div className="space-y-3">
+                                                    <div className="flex items-center gap-2">
+                                                        <input
+                                                            value={semanticQuery}
+                                                            onChange={(e) => setSemanticQuery(e.target.value)}
+                                                            onKeyDown={async (e) => {
+                                                                if (e.key !== 'Enter') return;
+                                                                const q = semanticQuery.trim();
+                                                                if (!q) return;
+                                                                setSemanticSearching(true);
+                                                                setSemanticError('');
+                                                                try {
+                                                                    const result = await window.electronAPI?.profileSemanticSearch?.(q, 8);
+                                                                    if (result?.success) setSemanticResults(result.results || []);
+                                                                    else setSemanticError(result?.error || 'Search failed');
+                                                                } catch (err: any) {
+                                                                    setSemanticError(err?.message || 'Search failed');
+                                                                } finally {
+                                                                    setSemanticSearching(false);
+                                                                }
+                                                            }}
+                                                            placeholder="Search: kubernetes migration, leadership stories, fintech projects..."
+                                                            className="w-full bg-bg-input border border-border-subtle rounded-lg px-3 py-2 text-xs text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-primary/50 focus:ring-1 focus:ring-accent-primary/20 transition-all"
+                                                        />
+                                                        <MagneticButton
+                                                            onClick={async () => {
+                                                                const q = semanticQuery.trim();
+                                                                if (!q) return;
+                                                                setSemanticSearching(true);
+                                                                setSemanticError('');
+                                                                try {
+                                                                    const result = await window.electronAPI?.profileSemanticSearch?.(q, 8);
+                                                                    if (result?.success) setSemanticResults(result.results || []);
+                                                                    else setSemanticError(result?.error || 'Search failed');
+                                                                } catch (err: any) {
+                                                                    setSemanticError(err?.message || 'Search failed');
+                                                                } finally {
+                                                                    setSemanticSearching(false);
+                                                                }
+                                                            }}
+                                                            disabled={semanticSearching || !semanticQuery.trim()}
+                                                        >
+                                                            {semanticSearching ? <RefreshCw size={14} className="animate-spin" /> : <Search size={14} />}
+                                                            {semanticSearching ? 'Searching…' : 'Search'}
+                                                        </MagneticButton>
+                                                    </div>
+
+                                                    {semanticError && (
+                                                        <div className="px-3 py-2 bg-red-500/10 border border-red-500/20 rounded-lg text-[11px] text-red-400">
+                                                            {semanticError}
+                                                        </div>
+                                                    )}
+
+                                                    {semanticResults.length > 0 && (
+                                                        <div className="space-y-2 max-h-[300px] overflow-y-auto pr-1">
+                                                            {semanticResults.map((item, idx) => (
+                                                                <div key={`${item.title}-${idx}`} className="bg-bg-input border border-border-subtle rounded-lg p-3">
+                                                                    <div className="flex items-center justify-between gap-2">
+                                                                        <div className="text-[11px] font-semibold text-text-primary truncate">{item.title}</div>
+                                                                        <span className="text-[9px] uppercase tracking-wide px-1.5 py-0.5 rounded border border-border-subtle text-text-tertiary">{item.category}</span>
+                                                                    </div>
+                                                                    <p className="text-[11px] text-text-secondary mt-1 leading-relaxed">{item.snippet}</p>
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </BezelCard>
+
                                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                         <BezelCard delay={0.3}>
                                         <div className="transition-all h-full">
@@ -670,13 +727,18 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                     <div className="w-10 h-10 rounded-lg bg-bg-input border border-border-subtle flex items-center justify-center text-text-tertiary shrink-0 mt-0.5 shadow-sm">
                                                         <Upload size={20} />
                                                     </div>
-                                                    <div className="min-w-0">
+                                                    <div className="min-w-0 flex-1">
                                                         <h4 className="text-[15px] font-bold text-text-primary mb-1 tracking-tight">
                                                             {profileStatus.hasProfile ? 'Overwrite Source Document' : 'Initialize Knowledge Base'}
                                                         </h4>
                                                         <p className="text-xs text-text-secondary leading-relaxed pr-2">
                                                             Provide a resume file to seed the intelligence engine.
                                                         </p>
+                                                        {resumeMeta?.filePath && (
+                                                            <div className="mt-2 text-xs font-semibold text-accent-primary bg-accent-primary/5 border border-accent-primary/10 rounded-md px-2.5 py-1 w-fit max-w-full truncate" title={resumeMeta.filePath}>
+                                                                File: {resumeMeta.filePath.split(/[/\\]/).pop()}
+                                                            </div>
+                                                        )}
                                                     </div>
                                                 </div>
 
@@ -695,6 +757,7 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                                 if (status) setProfileStatus(status);
                                                                 const data = await window.electronAPI?.profileGetProfile?.();
                                                                 if (data) setProfileData(data);
+                                                                if (result?.state?.resume) setResumeMeta(result.state.resume);
                                                             } else {
                                                                 setProfileError(result?.error || 'Upload failed');
                                                             }
@@ -748,20 +811,34 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                             {profileData?.hasActiveJD ? `${profileData.activeJD?.title} @ ${profileData.activeJD?.company}` : 'Upload Job Description'}
                                                         </h4>
                                                         {profileData?.hasActiveJD ? (
-                                                            <div className="flex items-center gap-3 mt-1 flex-wrap">
-                                                                <span className="text-[9px] font-bold text-blue-500 px-1.5 py-0.5 bg-blue-500/10 rounded uppercase tracking-wide border border-blue-500/20">
-                                                                    {profileData.activeJD?.level || 'mid'}-level
-                                                                </span>
-                                                                <div className="flex gap-1.5 flex-wrap">
-                                                                    {profileData.activeJD?.technologies?.slice(0, 3).map((t: string, i: number) => (
-                                                                        <span key={i} className="text-[10px] text-text-secondary">{t}</span>
-                                                                    ))}
+                                                            <div className="flex flex-col gap-1.5 mt-1">
+                                                                {jdMeta?.filePath && (
+                                                                    <div className="text-xs font-semibold text-accent-primary bg-accent-primary/5 border border-accent-primary/10 rounded-md px-2.5 py-1 w-fit max-w-full truncate" title={jdMeta.filePath}>
+                                                                        File: {jdMeta.filePath.split(/[/\\]/).pop()}
+                                                                    </div>
+                                                                )}
+                                                                <div className="flex items-center gap-3 flex-wrap">
+                                                                    <span className="text-[9px] font-bold text-blue-500 px-1.5 py-0.5 bg-blue-500/10 rounded uppercase tracking-wide border border-blue-500/20">
+                                                                        {profileData.activeJD?.level || 'mid'}-level
+                                                                    </span>
+                                                                    <div className="flex gap-1.5 flex-wrap">
+                                                                        {profileData.activeJD?.technologies?.slice(0, 3).map((t: string, i: number) => (
+                                                                            <span key={i} className="text-[10px] text-text-secondary">{t}</span>
+                                                                        ))}
+                                                                    </div>
                                                                 </div>
                                                             </div>
                                                         ) : (
-                                                            <p className="text-xs text-text-secondary leading-relaxed pr-2">
-                                                                Upload a JD to enable persona tuning and company research.
-                                                            </p>
+                                                            <div className="flex flex-col gap-1.5">
+                                                                <p className="text-xs text-text-secondary leading-relaxed pr-2">
+                                                                    Upload a JD to enable persona tuning and company research.
+                                                                </p>
+                                                                {jdMeta?.filePath && (
+                                                                    <div className="text-xs font-semibold text-accent-primary bg-accent-primary/5 border border-accent-primary/10 rounded-md px-2.5 py-1 w-fit max-w-full truncate" title={jdMeta.filePath}>
+                                                                        File: {jdMeta.filePath.split(/[/\\]/).pop()}
+                                                                    </div>
+                                                                )}
+                                                            </div>
                                                         )}
                                                     </div>
                                                     {profileData?.hasActiveJD && !jdUploading && (
@@ -771,6 +848,7 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                                 const data = await window.electronAPI?.profileGetProfile?.();
                                                                 if (data) setProfileData(data);
                                                                 setCompanyDossier(null);
+                                                                setJdMeta(null);
                                                             }}
                                                             className="shrink-0 mt-0.5 px-2.5 py-2 rounded-full text-xs text-text-tertiary hover:text-red-500 hover:bg-red-500/10 transition-all border border-transparent hover:border-red-500/20"
                                                             aria-label="Remove job description"
@@ -793,6 +871,7 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                             if (result?.success) {
                                                                 const data = await window.electronAPI?.profileGetProfile?.();
                                                                 if (data) setProfileData(data);
+                                                                if (result?.state?.jobDescription) setJdMeta(result.state.jobDescription);
                                                             } else {
                                                                 setJdError(result?.error || 'JD upload failed');
                                                             }
@@ -863,16 +942,16 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                             const val = e.target.value;
                                                             if (val.length > 4000) return;
                                                             setCustomNotes(val);
+                                                            customNotesRef.current = val;
                                                             setCustomNotesSaved(false);
                                                             if (customNotesDebounceRef.current) clearTimeout(customNotesDebounceRef.current);
                                                             customNotesDebounceRef.current = setTimeout(async () => {
                                                                 try {
-                                                                    await window.electronAPI?.profileSaveNotes?.(val);
-                                                                    setCustomNotesSaved(true);
-                                                                    setTimeout(() => setCustomNotesSaved(false), 2000);
+                                                                    await saveCustomNotesNow(val);
                                                                 } catch (_) {}
                                                             }, 800);
                                                         }}
+                                                        onBlur={() => { saveCustomNotesNow().catch(() => { }); }}
                                                         placeholder={`Examples:\n• Q4 ARR was $2.1M, grew 40% YoY — use when pitching growth story\n• Solved LRU Cache (LeetCode 146) with O(1) get/put using HashMap + doubly linked list\n• I prefer concise, direct answers without filler phrases\n• My target salary is $180k base — don't go below $160k`}
                                                         rows={6}
                                                         className="w-full bg-bg-input border border-border-subtle rounded-lg px-3 py-2.5 text-xs text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-primary/50 focus:ring-1 focus:ring-accent-primary/20 transition-all resize-none leading-relaxed"
@@ -1021,7 +1100,7 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                         <span className="shrink-0 mt-[1px]">⚠</span>
                                                         <span>
                                                             Web search credits exhausted for this month — showing AI-only research instead.
-                                                            Resets next billing cycle or <span className="underline cursor-pointer" onClick={() => (window.electronAPI as any)?.openExternal?.('https://checkout.dodopayments.com/buy/pdt_0NbFixGmD8CSeawb5qvVl')}>upgrade your plan</span>.
+                                                            Add more company details in Custom Context to improve local analysis quality.
                                                         </span>
                                                     </div>
                                                 )}
@@ -1030,11 +1109,29 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                 {companyDossier && (
                                                     <div className="space-y-4 border-t border-border-subtle pt-4 mt-2">
 
-                                                        {/* Hiring Strategy */}
-                                                        {companyDossier.hiring_strategy && (
+                                                        {/* Overview */}
+                                                        {(companyDossier.company_overview || companyDossier.hiring_strategy) && (
                                                             <div>
-                                                                <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-1">Hiring Strategy</div>
-                                                                <p className="text-xs text-text-secondary leading-relaxed bg-bg-input p-3 rounded-lg">{companyDossier.hiring_strategy}</p>
+                                                                <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-1">Overview</div>
+                                                                <p className="text-xs text-text-secondary leading-relaxed bg-bg-input p-3 rounded-lg">{companyDossier.company_overview || companyDossier.hiring_strategy}</p>
+                                                            </div>
+                                                        )}
+
+                                                        {companyDossier.products_and_services?.length > 0 && (
+                                                            <div>
+                                                                <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-2">Products & Services</div>
+                                                                <div className="flex flex-wrap gap-1.5">
+                                                                    {companyDossier.products_and_services.map((item: string, i: number) => (
+                                                                        <span key={i} className="text-[11px] text-blue-400/90 px-2.5 py-1 rounded-full bg-blue-500/10 border border-blue-500/20">{item}</span>
+                                                                    ))}
+                                                                </div>
+                                                            </div>
+                                                        )}
+
+                                                        {(companyDossier.hiring_trends || companyDossier.business_model) && (
+                                                            <div>
+                                                                <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-1">Hiring Signals</div>
+                                                                <p className="text-xs text-text-secondary leading-relaxed bg-bg-input p-3 rounded-lg">{companyDossier.hiring_trends || companyDossier.business_model}</p>
                                                             </div>
                                                         )}
 
@@ -1209,10 +1306,28 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                         )}
 
                                                         {/* Recent News */}
-                                                        {companyDossier.recent_news && (
+                                                        {companyDossier.company_culture_summary && (
+                                                            <div>
+                                                                <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-1">Culture</div>
+                                                                <p className="text-xs text-text-secondary leading-relaxed bg-bg-input p-3 rounded-lg">{companyDossier.company_culture_summary}</p>
+                                                            </div>
+                                                        )}
+
+                                                        {companyDossier.interview_insights && (
+                                                            <div>
+                                                                <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-1">Interview Insights</div>
+                                                                <p className="text-xs text-text-secondary leading-relaxed bg-bg-input p-3 rounded-lg">{companyDossier.interview_insights}</p>
+                                                            </div>
+                                                        )}
+
+                                                        {companyDossier.recent_news?.length > 0 && (
                                                             <div>
                                                                 <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-1">Recent News</div>
-                                                                <p className="text-xs text-text-secondary leading-relaxed bg-bg-input p-3 rounded-lg">{companyDossier.recent_news}</p>
+                                                                <div className="space-y-1.5 bg-bg-input p-3 rounded-lg">
+                                                                    {companyDossier.recent_news.map((item: string, i: number) => (
+                                                                        <p key={i} className="text-xs text-text-secondary leading-relaxed">{item}</p>
+                                                                    ))}
+                                                                </div>
                                                             </div>
                                                         )}
 
@@ -1249,9 +1364,60 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                             </div>
                                         </BezelCard>
                                     )}
-                                    <div className="pt-4">
-                                        <ProfileVisualizer profileData={profileData} />
-                                    </div>
+                                    {profileData && (
+                                        <BezelCard delay={0.55}>
+                                            <div className="p-5">
+                                                <div className="flex items-center gap-3 mb-4">
+                                                    <div className="w-9 h-9 rounded-lg bg-bg-input border border-border-subtle flex items-center justify-center text-blue-400">
+                                                        <Sparkles size={16} />
+                                                    </div>
+                                                    <div>
+                                                        <h3 className="text-[13px] font-bold text-text-primary tracking-tight">Match Intelligence</h3>
+                                                        <p className="text-[10px] text-text-tertiary mt-0.5 tracking-wide uppercase">Resume + JD + custom context</p>
+                                                    </div>
+                                                </div>
+                                                {profileData.careerSummary && (
+                                                    <p className="text-xs text-text-secondary leading-relaxed bg-bg-input p-3 rounded-lg mb-4">{profileData.careerSummary}</p>
+                                                )}
+                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                                    <div className="bg-bg-input border border-border-subtle rounded-lg p-3">
+                                                        <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-2">Aligned Skills</div>
+                                                        <div className="flex flex-wrap gap-1.5">
+                                                            {(profileData.matchInsights?.overlapSkills?.length ? profileData.matchInsights.overlapSkills : profileData.skills?.slice(0, 8) || []).map((skill: string, i: number) => (
+                                                                <span key={i} className="text-[10px] text-emerald-400 px-2 py-1 rounded-md border border-emerald-500/20 bg-emerald-500/10">{skill}</span>
+                                                            ))}
+                                                        </div>
+                                                    </div>
+                                                    <div className="bg-bg-input border border-border-subtle rounded-lg p-3">
+                                                        <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-2">Gap Analysis</div>
+                                                        <div className="flex flex-wrap gap-1.5">
+                                                            {(profileData.matchInsights?.gapSkills?.length ? profileData.matchInsights.gapSkills : ['No major gaps detected']).map((skill: string, i: number) => (
+                                                                <span key={i} className="text-[10px] text-amber-400 px-2 py-1 rounded-md border border-amber-500/20 bg-amber-500/10">{skill}</span>
+                                                            ))}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                                                    <div className="bg-bg-input border border-border-subtle rounded-lg p-3">
+                                                        <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-2">Interview Prep</div>
+                                                        <ul className="space-y-1.5">
+                                                            {(profileData.matchInsights?.interviewPreparation || []).slice(0, 4).map((item: string, i: number) => (
+                                                                <li key={i} className="text-[11px] text-text-secondary leading-relaxed">{item}</li>
+                                                            ))}
+                                                        </ul>
+                                                    </div>
+                                                    <div className="bg-bg-input border border-border-subtle rounded-lg p-3">
+                                                        <div className="text-[10px] font-bold text-text-primary uppercase tracking-wide mb-2">Career Advice</div>
+                                                        <ul className="space-y-1.5">
+                                                            {(profileData.matchInsights?.personalizedCareerAdvice || []).slice(0, 4).map((item: string, i: number) => (
+                                                                <li key={i} className="text-[11px] text-text-secondary leading-relaxed">{item}</li>
+                                                            ))}
+                                                        </ul>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </BezelCard>
+                                    )}
 
                                     {profileData?.hasActiveJD && (
                                         <BezelCard delay={0.6}>
@@ -1394,7 +1560,7 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                                     step: '01',
                                                                     label: 'Opening',
                                                                     sublabel: 'When asked about salary expectations',
-                                                                    content: negotiationScript.opening_line,
+                                                                    content: negotiationScript.opening_line || negotiationScript.negotiation_scripts?.opening,
                                                                     accent: '#10b981',
                                                                     accentBg: 'rgba(16,185,129,0.07)',
                                                                     accentBorder: 'rgba(16,185,129,0.2)',
@@ -1404,7 +1570,7 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                                     step: '02',
                                                                     label: 'Justify Your Ask',
                                                                     sublabel: 'Link your track record to the number',
-                                                                    content: negotiationScript.justification,
+                                                                    content: negotiationScript.justification || negotiationScript.negotiation_scripts?.anchoring || negotiationScript.negotiation_strategy?.join(' '),
                                                                     accent: '#60a5fa',
                                                                     accentBg: 'rgba(96,165,250,0.07)',
                                                                     accentBorder: 'rgba(96,165,250,0.2)',
@@ -1414,13 +1580,13 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                                                                     step: '03',
                                                                     label: 'Counter & Hold',
                                                                     sublabel: 'If they come back lower',
-                                                                    content: negotiationScript.counter_offer_fallback,
+                                                                    content: negotiationScript.counter_offer_fallback || negotiationScript.negotiation_scripts?.pushback_response || negotiationScript.counter_offer_suggestions?.join(' '),
                                                                     accent: '#fb923c',
                                                                     accentBg: 'rgba(251,146,60,0.07)',
                                                                     accentBorder: 'rgba(251,146,60,0.2)',
                                                                     quote: true,
                                                                 },
-                                                            ].filter(s => s.content).map((s) => ({ ...s, content: s.content.replace(/^["'"']+|["'"']+$/g, '').trim() })).map((s) => (
+                                                            ].filter(s => s.content).map((s) => ({ ...s, content: String(s.content).replace(/^["'"']+|["'"']+$/g, '').trim() })).map((s) => (
                                                                 <div key={s.step} className="rounded-xl overflow-hidden" style={{ border: `1px solid ${s.accentBorder}`, background: s.accentBg }}>
                                                                     <div className="flex items-center justify-between px-3.5 pt-3 pb-2">
                                                                         <div className="flex items-center gap-2">
@@ -1454,33 +1620,6 @@ export function ProfileIntelligenceSettings({ onClose }: { onClose: () => void }
                 </div>
             </div>
 
-            <PremiumUpgradeModal
-                isOpen={isPremiumModalOpen}
-                onClose={() => setIsPremiumModalOpen(false)}
-                isPremium={isPremium}
-                onActivated={async () => {
-                    setIsPremium(true);
-                    // Refresh plan + cache from the canonical source so the
-                    // header reflects the new state on every subsequent mount.
-                    try {
-                        const details = await window.electronAPI?.licenseGetDetails?.();
-                        const plan = details?.plan ?? '';
-                        if (plan) setPremiumPlan(plan);
-                        writePremiumCache(true, plan);
-                    } catch {
-                        writePremiumCache(true, premiumPlan);
-                    }
-                    const status = await window.electronAPI?.profileGetStatus?.();
-                    if (status) setProfileStatus(status);
-                }}
-                onDeactivated={() => {
-                    setIsPremium(false);
-                    setPremiumPlan('');
-                    writePremiumCache(false, '');
-                    // Auto-disable profile mode in UI when license is removed
-                    setProfileStatus(prev => ({ ...prev, profileMode: false }));
-                }}
-            />
         </div>
     );
 }

@@ -119,6 +119,8 @@ interface ElectronAPI {
   getAiResponseLanguages: () => Promise<Array<{ label: string; code: string }>>
   setAiResponseLanguage: (language: string) => Promise<{ success: boolean; error?: string }>
   getSttLanguage: () => Promise<string>
+  getInterviewerSttLanguage: () => Promise<string>
+  setInterviewerRecognitionLanguage: (key: string) => Promise<{ success: boolean; error?: string }>
   getAiResponseLanguage: () => Promise<string>
   onSttLanguageAutoDetected: (callback: (bcp47: string) => void) => () => void
   onSystemAudioPermissionDenied: (callback: (message: string) => void) => () => void
@@ -181,6 +183,8 @@ interface ElectronAPI {
   toggleSettingsWindow: (coords?: { x: number; y: number }) => Promise<void>
 
   // Groq Fast Text Mode
+  getAutoReplySettings: () => Promise<{ autoReplyOnFinal: boolean; speculativeAnswers: boolean }>
+  setAutoReplySettings: (patch: { autoReplyOnFinal?: boolean; speculativeAnswers?: boolean }) => Promise<{ success: boolean; autoReplyOnFinal?: boolean; speculativeAnswers?: boolean; error?: string }>
   getGroqFastTextMode: () => Promise<{ enabled: boolean }>
   setGroqFastTextMode: (enabled: boolean) => Promise<{ success: boolean; error?: string }>
   getCodexCliConfig: () => Promise<{ enabled: boolean; path: string; model: string; fastModel: string; timeoutMs: number }>
@@ -205,6 +209,10 @@ interface ElectronAPI {
   startAudioTest: (deviceId?: string) => Promise<{ success: boolean }>
   stopAudioTest: () => Promise<{ success: boolean }>
   onAudioTestLevel: (callback: (level: number) => void) => () => void
+  startSystemAudioTest: (deviceId?: string) => Promise<{ success: boolean }>
+  stopSystemAudioTest: () => Promise<{ success: boolean }>
+  onSystemAudioTestLevel: (callback: (level: number) => void) => () => void
+  checkDesktopCapture: () => Promise<{ success: boolean; count: number; sources?: Array<{ id: string; name: string }>; error?: string }>
 
   // Database
   flushDatabase: () => Promise<{ success: boolean }>
@@ -307,7 +315,7 @@ interface ElectronAPI {
   setDonationComplete: () => Promise<{ success: boolean }>;
 
   // Profile Engine API
-  profileUploadResume: (filePath: string) => Promise<{ success: boolean; error?: string }>;
+  profileUploadResume: (filePath: string) => Promise<{ success: boolean; error?: string; state?: any }>;
   profileGetStatus: () => Promise<{ hasProfile: boolean; profileMode: boolean; name?: string; role?: string; totalExperienceYears?: number }>;
   profileSetMode: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
   profileDelete: () => Promise<{ success: boolean; error?: string }>;
@@ -315,12 +323,21 @@ interface ElectronAPI {
   profileSelectFile: () => Promise<{ success?: boolean; cancelled?: boolean; filePath?: string; error?: string }>;
 
   // JD & Research API
-  profileUploadJD: (filePath: string) => Promise<{ success: boolean; error?: string }>;
+  profileUploadJD: (filePath: string) => Promise<{ success: boolean; error?: string; state?: any }>;
   profileDeleteJD: () => Promise<{ success: boolean; error?: string }>;
-  profileResearchCompany: (companyName: string) => Promise<{ success: boolean; dossier?: any; error?: string }>;
+  profileResearchCompany: (companyName: string) => Promise<{ success: boolean; dossier?: any; error?: string; searchQuotaExhausted?: boolean }>;
   profileGenerateNegotiation: (force?: boolean) => Promise<{ success: boolean; script?: any; error?: string }>;
   profileGetNegotiationState: () => Promise<{ success: boolean; state?: any; isActive?: boolean; error?: string }>;
   profileResetNegotiation: () => Promise<{ success: boolean; error?: string }>;
+  profileSemanticSearch: (query: string, limit?: number) => Promise<{ success: boolean; results?: Array<{ category: string; title: string; snippet: string; score: number }>; error?: string }>;
+
+  // Career Intelligence API aliases
+  resumeUpload: (filePath: string) => Promise<{ success: boolean; error?: string; state?: any }>;
+  jdUpload: (filePath: string) => Promise<{ success: boolean; error?: string; state?: any }>;
+  companyResearch: (input: string | { companyName?: string }) => Promise<{ success: boolean; dossier?: any; error?: string; searchQuotaExhausted?: boolean }>;
+  salaryAnalyze: (input?: { force?: boolean }) => Promise<{ success: boolean; report?: any; script?: any; error?: string }>;
+  contextQuery: (input: string | { query?: string; limit?: number }) => Promise<{ success: boolean; query?: string; answer?: string; context?: string; results?: any[]; error?: string }>;
+  profileState: () => Promise<{ success: boolean; status?: any; profile?: any; negotiation?: any; companyDossier?: any; resume?: any; jobDescription?: any; error?: string }>;
 
   // Tavily Search API
   setTavilyApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>;
@@ -741,6 +758,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getAiResponseLanguages: () => ipcRenderer.invoke("get-ai-response-languages"),
   setAiResponseLanguage: (language: string) => ipcRenderer.invoke("set-ai-response-language", language),
   getSttLanguage: () => ipcRenderer.invoke("get-stt-language"),
+  getInterviewerSttLanguage: () => ipcRenderer.invoke("get-interviewer-stt-language"),
+  setInterviewerRecognitionLanguage: (key: string) => ipcRenderer.invoke("set-interviewer-recognition-language", key),
   getAiResponseLanguage: () => ipcRenderer.invoke("get-ai-response-language"),
   onSttLanguageAutoDetected: (callback: (bcp47: string) => void) => {
     const subscription = (_: any, bcp47: string) => callback(bcp47);
@@ -991,6 +1010,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   toggleSettingsWindow: (coords?: { x: number; y: number }) => ipcRenderer.invoke('toggle-settings-window', coords),
 
   // Groq Fast Text Mode
+  getAutoReplySettings: () => ipcRenderer.invoke('get-auto-reply-settings'),
+  setAutoReplySettings: (patch: { autoReplyOnFinal?: boolean; speculativeAnswers?: boolean }) => ipcRenderer.invoke('set-auto-reply-settings', patch),
   getGroqFastTextMode: () => ipcRenderer.invoke('get-groq-fast-text-mode'),
   setGroqFastTextMode: (enabled: boolean) => ipcRenderer.invoke('set-groq-fast-text-mode', enabled),
   getCodexCliConfig: () => ipcRenderer.invoke('get-codex-cli-config'),
@@ -1021,6 +1042,16 @@ contextBridge.exposeInMainWorld("electronAPI", {
       ipcRenderer.removeListener('audio-test-level', subscription)
     }
   },
+  startSystemAudioTest: (deviceId?: string) => ipcRenderer.invoke('start-system-audio-test', deviceId),
+  stopSystemAudioTest: () => ipcRenderer.invoke('stop-system-audio-test'),
+  onSystemAudioTestLevel: (callback: (level: number) => void) => {
+    const subscription = (_: any, level: number) => callback(level)
+    ipcRenderer.on('system-audio-test-level', subscription)
+    return () => {
+      ipcRenderer.removeListener('system-audio-test-level', subscription)
+    }
+  },
+  checkDesktopCapture: () => ipcRenderer.invoke('diagnostics:check-desktop-capture'),
 
   // Database
   flushDatabase: () => ipcRenderer.invoke('flush-database'),
@@ -1249,8 +1280,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
   profileGenerateNegotiation: (force?: boolean) => ipcRenderer.invoke('profile:generate-negotiation', force),
   profileGetNegotiationState: () => ipcRenderer.invoke('profile:get-negotiation-state'),
   profileResetNegotiation: () => ipcRenderer.invoke('profile:reset-negotiation'),
+  profileSemanticSearch: (query: string, limit?: number) => ipcRenderer.invoke('profile:semantic-search', query, limit),
   profileGetNotes: () => ipcRenderer.invoke('profile:get-notes'),
   profileSaveNotes: (content: string) => ipcRenderer.invoke('profile:save-notes', content),
+
+  // Career Intelligence API aliases
+  resumeUpload: (filePath: string) => ipcRenderer.invoke('resume/upload', filePath),
+  jdUpload: (filePath: string) => ipcRenderer.invoke('jd/upload', filePath),
+  companyResearch: (input: string | { companyName?: string }) => ipcRenderer.invoke('company/research', input),
+  salaryAnalyze: (input?: { force?: boolean }) => ipcRenderer.invoke('salary/analyze', input),
+  contextQuery: (input: string | { query?: string; limit?: number }) => ipcRenderer.invoke('context/query', input),
+  profileState: () => ipcRenderer.invoke('profile/state'),
 
   // Tavily Search API
   setTavilyApiKey: (apiKey: string) => ipcRenderer.invoke('set-tavily-api-key', apiKey),

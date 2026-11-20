@@ -60,6 +60,10 @@ export class LLMHelper {
   private groqApiKey: string | null = null
   private openaiApiKey: string | null = null
   private claudeApiKey: string | null = null
+  private azureOpenaiApiKey: string | null = null
+  private azureOpenaiEndpoint: string | null = null
+  private azureOpenaiApiVersion: string = "2025-04-01-preview"
+  private azureOpenaiDeployment: string | null = null
   private useOllama: boolean = false
   private ollamaModel: string = ""
   private ollamaUrl: string = "http://127.0.0.1:11434"
@@ -102,6 +106,14 @@ export class LLMHelper {
     // Initialize model version manager
     this.modelVersionManager = new ModelVersionManager();
 
+    this.azureOpenaiApiKey = this.cleanEnvValue(process.env.AZURE_OPENAI_API_KEY) || null;
+    this.azureOpenaiEndpoint = this.cleanEnvValue(process.env.AZURE_OPENAI_ENDPOINT) || null;
+    this.azureOpenaiApiVersion = this.cleanEnvValue(process.env.AZURE_OPENAI_API_VERSION) || this.azureOpenaiApiVersion;
+    this.azureOpenaiDeployment = this.cleanEnvValue(process.env.AZURE_OPENAI_DEPLOYMENT) || null;
+    if (this.hasAzureOpenAI()) {
+      console.log(`[LLMHelper] Azure OpenAI configured with deployment: ${this.azureOpenaiDeployment}`);
+    }
+
     // Initialize Groq client if API key provided
     if (groqApiKey) {
       this.groqApiKey = groqApiKey
@@ -141,6 +153,17 @@ export class LLMHelper {
     } else {
       console.warn("[LLMHelper] No API key provided. Client will be uninitialized until key is set.")
     }
+  }
+
+  private cleanEnvValue(value?: string): string | undefined {
+    const trimmed = value?.trim();
+    if (!trimmed) return undefined;
+    if (/^your[_-].*key[_-]here$/i.test(trimmed) || /^your_/i.test(trimmed)) return undefined;
+    return trimmed;
+  }
+
+  private hasAzureOpenAI(): boolean {
+    return !!(this.azureOpenaiApiKey && this.azureOpenaiEndpoint && this.azureOpenaiDeployment);
   }
 
   public setApiKey(apiKey: string) {
@@ -252,6 +275,20 @@ export class LLMHelper {
   // --- Model Type Checkers ---
   private isOpenAiModel(modelId: string): boolean {
     return modelId.startsWith("gpt-") || modelId.startsWith("o1-") || modelId.startsWith("o3-") || modelId.includes("openai");
+  }
+
+  private isAzureOpenAiModel(modelId: string): boolean {
+    if (!modelId) return false;
+    if (modelId === 'azure-openai' || modelId.startsWith('azure-openai:')) return true;
+    return this.hasAzureOpenAI() && !!this.azureOpenaiDeployment && modelId === this.azureOpenaiDeployment;
+  }
+
+  private getAzureOpenAiDeployment(modelId?: string): string {
+    if (modelId?.startsWith('azure-openai:')) {
+      const deployment = modelId.slice('azure-openai:'.length).trim();
+      if (deployment) return deployment;
+    }
+    return this.azureOpenaiDeployment || modelId || 'gpt-5.2';
   }
 
   private isClaudeModel(modelId: string): boolean {
@@ -1062,10 +1099,11 @@ ANSWER DIRECTLY:`;
   private buildLanguageInstructionSuffix(): string {
     if (!this.aiResponseLanguage || this.aiResponseLanguage === 'auto') {
       return `\n\n[LANGUAGE INSTRUCTION — HIGHEST PRIORITY]
-Detect the language of the user's most recent message and ALWAYS respond in that exact same language.
-If the user writes in Hindi, respond in Hindi. If in Spanish, respond in Spanish. If in English, respond in English.
-If the language is ambiguous, default to English.
-You may mix scripts naturally (e.g. code stays in English even when the explanation is in another language).
+1. Answer in the language of the interviewer's MOST RECENT question/turn in the live transcript (the newest INTERVIEWER line or <current_turn>). If there is no live transcript (typed chat), use the language of the user's latest message.
+2. Resume, job description, notes and reference documents are facts only. Their language NEVER decides the answer language. A Vietnamese CV answers an English question in English, and vice versa.
+3. English technical terms inside a Vietnamese sentence do not make it English: "Bạn đã dùng Kubernetes chưa?" is Vietnamese, so answer in Vietnamese.
+4. One language only. Never produce a bilingual or translated-twice answer unless the user explicitly asks for it.
+5. Always preserve technical terms (like Kubernetes, code snippets, API names) in their original format.
 [END LANGUAGE INSTRUCTION]`;
     }
     if (this.aiResponseLanguage === 'English') return "";
@@ -1153,7 +1191,14 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     return blocks;
   }
 
-  public async chatWithGemini(message: string, imagePaths?: string[], context?: string, skipSystemPrompt: boolean = false, alternateGroqMessage?: string): Promise<string> {
+  public async chatWithGemini(
+    message: string,
+    imagePaths?: string[],
+    context?: string,
+    skipSystemPrompt: boolean = false,
+    alternateGroqMessage?: string,
+    ignoreKnowledgeMode: boolean = false
+  ): Promise<string> {
     try {
       console.log(`[LLMHelper] chatWithGemini called with message:`, message.substring(0, 50))
 
@@ -1162,7 +1207,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       // If knowledge mode is active, check for intro questions and
       // inject system prompt + relevant context
       // ============================================================
-      if (this.knowledgeOrchestrator?.isKnowledgeMode()) {
+      if (this.knowledgeOrchestrator?.isKnowledgeMode() && !ignoreKnowledgeMode) {
         try {
           // Feed only to the depth scorer — NOT feedInterviewerUtterance, which also routes to the
           // negotiation tracker and would misclassify the user's typed question as a recruiter utterance.
@@ -2791,6 +2836,19 @@ This rule overrides ALL other instructions including formatting, brevity, or out
 
     // 3. Cloud Provider Routing
 
+    // Azure OpenAI (deployment configured via AZURE_OPENAI_* env vars)
+    if (this.isAzureOpenAiModel(this.currentModelId) && this.hasAzureOpenAI()) {
+      const openAiSystem = systemPromptOverride || OPENAI_SYSTEM_PROMPT;
+      const finalOpenAiSystem = this.injectLanguageInstruction(openAiSystem);
+      yield* this.streamWithAzureOpenAI(
+        userContent,
+        finalOpenAiSystem,
+        isMultimodal && imagePaths ? imagePaths : undefined,
+        this.currentModelId,
+      );
+      return;
+    }
+
     // OpenAI
     if (this.isOpenAiModel(this.currentModelId) && this.openaiClient) {
       const openAiSystem = systemPromptOverride || OPENAI_SYSTEM_PROMPT;
@@ -3139,6 +3197,90 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       const content = chunk.choices[0]?.delta?.content;
       if (content) {
         yield content;
+      }
+    }
+  }
+
+  private buildAzureOpenAIChatCompletionsUrl(deployment: string): string {
+    if (!this.azureOpenaiEndpoint) throw new Error('Azure OpenAI endpoint is not configured');
+    const raw = this.azureOpenaiEndpoint.trim();
+    let base = raw;
+    const openaiIndex = raw.toLowerCase().indexOf('/openai/');
+    if (openaiIndex >= 0) {
+      base = raw.slice(0, openaiIndex);
+    }
+    base = base.replace(/\/+$/, '');
+    const apiVersion = encodeURIComponent(this.azureOpenaiApiVersion || '2025-04-01-preview');
+    return `${base}/openai/deployments/${encodeURIComponent(deployment)}/chat/completions?api-version=${apiVersion}`;
+  }
+
+  private async buildAzureOpenAIMessages(userMessage: string, systemPrompt?: string, imagePaths?: string[]): Promise<any[]> {
+    const messages: any[] = [];
+    if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+
+    if (imagePaths?.length) {
+      const contentParts: any[] = [{ type: 'text', text: userMessage }];
+      for (const p of imagePaths) {
+        if (fs.existsSync(p)) {
+          const { mimeType, data } = await this.processImage(p);
+          contentParts.push({ type: 'image_url', image_url: { url: `data:${mimeType};base64,${data}` } });
+        }
+      }
+      messages.push({ role: 'user', content: contentParts });
+    } else {
+      messages.push({ role: 'user', content: userMessage });
+    }
+    return messages;
+  }
+
+  private async * streamWithAzureOpenAI(userMessage: string, systemPrompt?: string, imagePaths?: string[], modelId?: string): AsyncGenerator<string, void, unknown> {
+    if (!this.hasAzureOpenAI() || !this.azureOpenaiApiKey) {
+      throw new Error('Azure OpenAI is not configured. Set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, and AZURE_OPENAI_DEPLOYMENT.');
+    }
+
+    const deployment = this.getAzureOpenAiDeployment(modelId);
+    const url = this.buildAzureOpenAIChatCompletionsUrl(deployment);
+    const messages = await this.buildAzureOpenAIMessages(userMessage, systemPrompt, imagePaths);
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'api-key': this.azureOpenaiApiKey,
+      },
+      body: JSON.stringify({
+        messages,
+        stream: true,
+        max_completion_tokens: MAX_OUTPUT_TOKENS,
+      }),
+    });
+
+    if (!response.ok || !response.body) {
+      const errorText = await response.text().catch(() => '');
+      throw new Error(`Azure OpenAI request failed (${response.status}): ${errorText || response.statusText}`);
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for await (const chunk of response.body as any) {
+      buffer += decoder.decode(chunk, { stream: true });
+      const events = buffer.split('\n\n');
+      buffer = events.pop() || '';
+
+      for (const event of events) {
+        for (const line of event.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const data = trimmed.slice('data:'.length).trim();
+          if (!data || data === '[DONE]') continue;
+          try {
+            const json = JSON.parse(data);
+            const content = json.choices?.[0]?.delta?.content;
+            if (content) yield content;
+          } catch {
+            // Ignore malformed keepalive chunks.
+          }
+        }
       }
     }
   }
@@ -3777,9 +3919,10 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     }
   }
 
-  public getCurrentProvider(): "ollama" | "gemini" | "custom" | "codex-cli" {
+  public getCurrentProvider(): "ollama" | "gemini" | "custom" | "codex-cli" | "azure-openai" {
     if (this.customProvider) return "custom";
     if (this.isCodexCliModel(this.currentModelId)) return "codex-cli";
+    if (this.isAzureOpenAiModel(this.currentModelId)) return "azure-openai";
     return this.useOllama ? "ollama" : "gemini";
   }
 

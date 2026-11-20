@@ -348,7 +348,7 @@ const BASELINE_SCENARIOS: EvalScenario[] = [
     contextBlock: '<active_mode_custom_instructions priority="highest">No resume context loaded. Use admission template before giving a generic realistic example.</active_mode_custom_instructions>',
     transcript: 'Interviewer: Tell me about a time you had to influence without authority.',
     latestQuestion: 'Answer as me.',
-    mustInclude: [/I don.*t have specific past experience loaded right now, so here.*s a realistic example along the lines of what I.*d answer/i],
+    mustInclude: [/No profile loaded: generic example, swap in your real project/i],
     mustNotInclude: [/At my previous company.*I led.*team.*10|definitely.*hire|i was great/i],
     maxLatencyMs: 12_000,
   },

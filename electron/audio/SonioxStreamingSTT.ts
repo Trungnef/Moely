@@ -84,19 +84,18 @@ export class SonioxStreamingSTT extends EventEmitter {
 
     /** Set recognition language hint using ISO-639-1 code */
     public setRecognitionLanguage(key: string): void {
-        const config = RECOGNITION_LANGUAGES[key];
-        if (config) {
-            this.languageCode = config.iso639;
-            console.log(`[SonioxStreaming] Language hint set to ${this.languageCode}`);
+        // 'auto' must be checked first: RECOGNITION_LANGUAGES has an 'auto' entry whose
+        // iso639 is the literal "auto", which Soniox would receive as a bogus hint.
+        const next = key === 'auto' ? undefined : RECOGNITION_LANGUAGES[key]?.iso639;
+        if (key !== 'auto' && !next) return;
+        if (next === this.languageCode) return;
+        this.languageCode = next;
+        console.log(`[SonioxStreaming] Language hint set to ${this.languageCode ?? 'auto'}`);
 
-            if (this.isActive) {
-                console.log('[SonioxStreaming] Language changed while active. Restarting...');
-                this.stop();
-                this.start();
-            }
-        } else if (key === 'auto') {
-            this.languageCode = undefined;
-            console.log(`[SonioxStreaming] Language hint set to auto`);
+        if (this.isActive) {
+            console.log('[SonioxStreaming] Language changed while active. Restarting...');
+            this.stop();
+            this.start();
         }
     }
 
@@ -114,7 +113,8 @@ export class SonioxStreamingSTT extends EventEmitter {
     // =========================================================================
 
     public start(): void {
-        if (this.isActive) return;
+        // Active-but-not-reconnecting means we gave up after max attempts — allow a re-arm.
+        if (this.isActive && this.shouldReconnect) return;
         this.isActive = true;        // Set immediately so write() buffers audio during WS handshake
         this.shouldReconnect = true;
         this.reconnectAttempts = 0;
@@ -126,16 +126,18 @@ export class SonioxStreamingSTT extends EventEmitter {
         this.clearTimers();
 
         if (this.ws) {
+            const ws = this.ws;
+            // Detach first so the old socket's close/message handlers can't touch the next one.
+            this.ws = null;
             try {
                 // Send empty string to signal end-of-audio
-                if (this.ws.readyState === WebSocket.OPEN) {
-                    this.ws.send('');
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send('');
                 }
             } catch {
                 // Ignore send errors during shutdown
             }
-            this.ws.close();
-            this.ws = null;
+            try { ws.close(1000); } catch { }
         }
 
         this.isActive = false;
@@ -186,27 +188,32 @@ export class SonioxStreamingSTT extends EventEmitter {
     private connect(): void {
         if (this.isConnecting) return;
         this.isConnecting = true;
-        
-        console.log(`[SonioxStreaming] Connecting (rate=${this.sampleRate}, ch=${this.numChannels})...`);
+
+        console.log(`[SonioxStreaming] Connecting (rate=${this.sampleRate}, ch=${this.numChannels}, lang=${this.languageCode ?? 'auto'})...`);
 
         this.configSent = false;
         // streamingStttWsOptions: forces IPv4-only DNS lookup (sidesteps Node's
         // macOS dual-stack ENOTFOUND on IPv4-only CNAME chains) and caps the
         // TLS+upgrade handshake at 15s. See dnsHelpers.ts.
-        this.ws = new WebSocket(SONIOX_WEBSOCKET_URL, streamingStttWsOptions() as any);
+        const ws = new WebSocket(SONIOX_WEBSOCKET_URL, streamingStttWsOptions() as any);
+        this.ws = ws;
+        // All handlers are bound to THIS socket. A restart (sample-rate/language
+        // change) replaces this.ws while the old socket is still closing; without
+        // this guard the old close handler nulled the new socket and its 1005
+        // close code scheduled a phantom reconnect.
+        const isCurrent = () => this.ws === ws;
 
-        this.ws.on('open', () => {
+        ws.on('open', () => {
             // Guard: stop() may have been called while the WS handshake was in flight.
-            // shouldReconnect is set to false by stop() before ws is nulled, so it's a
-            // reliable signal that we should abort here without crashing.
-            if (!this.shouldReconnect || !this.isActive) {
-                this.ws?.close();
-                this.ws = null;
-                this.isConnecting = false;
+            if (!isCurrent() || !this.shouldReconnect || !this.isActive) {
+                try { ws.close(1000); } catch { }
+                if (isCurrent()) {
+                    this.ws = null;
+                    this.isConnecting = false;
+                }
                 return;
             }
 
-            this.reconnectAttempts = 0;
             console.log('[SonioxStreaming] Connected, sending config...');
 
             // Send initial configuration as first message
@@ -225,9 +232,7 @@ export class SonioxStreamingSTT extends EventEmitter {
             }
 
             try {
-                // Use ?. (not !) — stop() could theoretically null this.ws between the
-                // guard above and this send, though the event loop makes it unlikely.
-                this.ws?.send(JSON.stringify(config));
+                ws.send(JSON.stringify(config));
                 this.configSent = true;
                 this.isConnecting = false;
                 console.log('[SonioxStreaming] Config sent');
@@ -235,8 +240,8 @@ export class SonioxStreamingSTT extends EventEmitter {
                 // Flush buffer after config is sent
                 while (this.buffer.length > 0) {
                     const chunk = this.buffer.shift();
-                    if (chunk && this.ws?.readyState === WebSocket.OPEN) {
-                        this.ws.send(chunk);
+                    if (chunk && ws.readyState === WebSocket.OPEN) {
+                        ws.send(chunk);
                     }
                 }
             } catch (err) {
@@ -248,16 +253,24 @@ export class SonioxStreamingSTT extends EventEmitter {
             this.startKeepAlive();
         });
 
-        this.ws.on('message', (data: WebSocket.Data) => {
+        ws.on('message', (data: WebSocket.Data) => {
+            if (!isCurrent()) return;
             try {
                 const msg = JSON.parse(data.toString());
 
-                // Error from server
+                // Error from server (bad key, bad config, quota...). Close the socket so
+                // the bounded reconnect path counts it, instead of leaving a dead session.
                 if (msg.error_code) {
                     console.error(`[SonioxStreaming] Server error: ${msg.error_code} - ${msg.error_message}`);
                     this.emit('error', new Error(`Soniox: ${msg.error_code} - ${msg.error_message}`));
+                    try { ws.close(4000, 'server error'); } catch { }
                     return;
                 }
+
+                // The server accepted our config — only now is the connection healthy.
+                // (Resetting on socket open let a server that keeps rejecting the config
+                // retry forever.)
+                this.reconnectAttempts = 0;
 
                 // Parse tokens from response
                 const tokens = msg.tokens;
@@ -265,6 +278,7 @@ export class SonioxStreamingSTT extends EventEmitter {
 
                 let currentFinalText = '';
                 let nonFinalText = '';
+                let endpoint = false;
 
                 for (const token of tokens) {
                     if (!token.text) continue;
@@ -275,7 +289,8 @@ export class SonioxStreamingSTT extends EventEmitter {
                     }
 
                     if (token.text === '<end>') {
-                        console.log('[SonioxStreaming] Received <end> endpoint detection marker');
+                        // Endpoint detection: the speaker finished an utterance.
+                        endpoint = true;
                         continue;
                     }
 
@@ -292,6 +307,7 @@ export class SonioxStreamingSTT extends EventEmitter {
                         text: currentFinalText,
                         isFinal: true,
                         confidence: 1.0,
+                        speechFinal: endpoint,
                     });
                 }
 
@@ -304,40 +320,39 @@ export class SonioxStreamingSTT extends EventEmitter {
                     });
                 }
 
+                if (endpoint) this.emit('utterance_end');
+
                 // Session finished
                 if (msg.finished) {
                     console.log('[SonioxStreaming] Session finished');
                     // We don't stop entirely, just clear WS so it can lazily reconnect on next audio
-                    if (this.ws) {
-                        this.ws.close();
-                        this.ws = null;
-                        this.configSent = false;
-                    }
+                    this.ws = null;
+                    this.configSent = false;
+                    this.clearKeepAlive();
+                    try { ws.close(1000); } catch { }
                 }
             } catch (err) {
                 console.error('[SonioxStreaming] Parse error:', err);
             }
         });
 
-        this.ws.on('error', (err: Error) => {
+        ws.on('error', (err: Error) => {
+            if (!isCurrent()) return;
             console.error('[SonioxStreaming] WebSocket error:', err.message);
             this.emit('error', err);
         });
 
-        this.ws.on('close', (code: number, reason: Buffer) => {
-            // Null out the ws reference immediately to prevent stale reuse
+        ws.on('close', (code: number, reason: Buffer) => {
+            console.log(`[SonioxStreaming] Closed (code=${code}, reason=${reason.toString()})`);
+            if (!isCurrent()) return;
             this.ws = null;
             this.isConnecting = false;
             this.configSent = false;
             this.clearKeepAlive();
-            console.log(`[SonioxStreaming] Closed (code=${code}, reason=${reason.toString()})`);
 
             // Auto-reconnect on unexpected close
             if (this.shouldReconnect && code !== 1000) {
                 this.scheduleReconnect();
-            } else {
-                // If not reconnecting, mark session as truly inactive
-                this.isActive = false;
             }
         });
     }

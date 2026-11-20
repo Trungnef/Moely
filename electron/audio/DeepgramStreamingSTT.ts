@@ -3,7 +3,7 @@
  *
  * Uses @deepgram/sdk v3 (listen.live) instead of raw WebSocket.
  * Implements the same EventEmitter interface as GoogleSTT:
- *   Events: 'transcript' ({ text, isFinal, confidence }), 'error' (Error)
+ *   Events: 'transcript' ({ text, isFinal, confidence, speechFinal }), 'utterance_end', 'error' (Error)
  *   Methods: start(), stop(), write(chunk), setSampleRate(), setAudioChannelCount()
  */
 
@@ -15,6 +15,13 @@ const RECONNECT_MAX_DELAY_MS = 30000;
 const RECONNECT_MAX_ATTEMPTS = 10;
 const KEEPALIVE_INTERVAL_MS = 8000;
 
+// Languages verified to stream on nova-3 (handshake accepted, 2026-11). Anything
+// else starts on nova-2, which has the broadest language coverage. 'multi' is
+// nova-3 code-switching (en/es/fr/de/hi/ru/pt/ja/it/nl — NOT Vietnamese).
+const NOVA3_LANGUAGES = new Set([
+    'multi', 'en', 'id', 'ru', 'es', 'fr', 'de', 'it', 'pt', 'ja', 'ko', 'zh', 'tr', 'uk', 'vi', 'nl', 'hi',
+]);
+
 export class DeepgramStreamingSTT extends EventEmitter {
     private apiKey: string;
     private live: any = null;
@@ -25,6 +32,8 @@ export class DeepgramStreamingSTT extends EventEmitter {
     private sampleRate = 16000;
     private numChannels = 1;
     private languageCode = 'en';
+    // Set when nova-3 refuses a non-English language at handshake — retry on nova-2.
+    private forceNova2 = false;
 
     private reconnectAttempts = 0;
     private reconnectTimer: NodeJS.Timeout | null = null;
@@ -52,22 +61,20 @@ export class DeepgramStreamingSTT extends EventEmitter {
     }
 
     public setRecognitionLanguage(key: string): void {
-        if (key === 'auto') {
-            if (this.languageCode === 'multi') return;
-            this.languageCode = 'multi';
-            console.log('[DeepgramStreaming] Language set to multilingual (multi)');
-            if (this.isActive) this.restartStream();
-            return;
-        }
-        const config = RECOGNITION_LANGUAGES[key];
-        if (config && this.languageCode !== config.iso639) {
-            this.languageCode = config.iso639;
-            console.log(`[DeepgramStreaming] Language set to ${this.languageCode}`);
-            if (this.isActive) this.restartStream();
-        }
+        const next = key === 'auto' ? 'multi' : RECOGNITION_LANGUAGES[key]?.iso639;
+        if (!next || next === this.languageCode) return;
+        this.languageCode = next;
+        this.forceNova2 = false;
+        console.log(`[DeepgramStreaming] Language set to ${this.languageCode} (model=${this.getModel()})`);
+        if (this.isActive) this.restartStream();
     }
 
     public setCredentials(_path: string): void { }
+
+    private getModel(): string {
+        if (this.forceNova2) return 'nova-2';
+        return NOVA3_LANGUAGES.has(this.languageCode) ? 'nova-3' : 'nova-2';
+    }
 
     private restartStream(): void {
         console.log('[DeepgramStreaming] Restarting due to config change...');
@@ -76,7 +83,8 @@ export class DeepgramStreamingSTT extends EventEmitter {
     }
 
     public start(): void {
-        if (this.isActive) return;
+        // Active-but-not-reconnecting means we gave up after max attempts — allow a re-arm.
+        if (this.isActive && this.shouldReconnect) return;
         this.isActive = true;
         this.shouldReconnect = true;
         this.reconnectAttempts = 0;
@@ -88,12 +96,14 @@ export class DeepgramStreamingSTT extends EventEmitter {
         this.clearTimers();
 
         if (this.live) {
+            const live = this.live;
+            // Detach first so late events from the old socket can't touch the next one.
+            this.live = null;
             try {
-                this.live.requestClose();
+                live.requestClose();
             } catch {
                 // ignore errors during shutdown
             }
-            this.live = null;
         }
 
         this.isActive = false;
@@ -137,15 +147,16 @@ export class DeepgramStreamingSTT extends EventEmitter {
         if (this.isConnecting) return;
         this.isConnecting = true;
 
-        console.log(`[DeepgramStreaming] Connecting (rate=${this.sampleRate}, ch=${this.numChannels}, lang=${this.languageCode})...`);
+        const model = this.getModel();
+        console.log(`[DeepgramStreaming] Connecting (model=${model}, rate=${this.sampleRate}, ch=${this.numChannels}, lang=${this.languageCode})...`);
 
         try {
             const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 
             const deepgram = createClient(this.apiKey);
 
-            this.live = deepgram.listen.live({
-                model: 'nova-3',
+            const live = deepgram.listen.live({
+                model,
                 language: this.languageCode,
                 smart_format: true,
                 interim_results: true,
@@ -156,65 +167,99 @@ export class DeepgramStreamingSTT extends EventEmitter {
                 utterance_end_ms: 1000,
                 vad_events: true,
             });
+            this.live = live;
+            let opened = false;
+            // Every handler is bound to THIS connection. A restart (e.g. the first
+            // chunk switching 16k→48k) replaces this.live while the old socket is
+            // still opening/closing; without this guard the old socket's Open
+            // handler would register a second Transcript listener on the new one
+            // and its Close would clear the new connection's timers.
+            const isCurrent = () => this.live === live;
 
-            this.live.on(LiveTranscriptionEvents.Open, () => {
+            live.on(LiveTranscriptionEvents.Open, () => {
+                if (!isCurrent()) {
+                    try { live.requestClose(); } catch { }
+                    return;
+                }
+                opened = true;
                 this.isConnecting = false;
                 this.isOpen = true;
-                console.log('[DeepgramStreaming] Connected');
+                console.log(`[DeepgramStreaming] Connected (model=${model}, lang=${this.languageCode})`);
 
-                // Register Transcript inside Open per SDK README pattern
-                this.live.on(LiveTranscriptionEvents.Transcript, (data: any) => {
+                live.on(LiveTranscriptionEvents.Transcript, (data: any) => {
+                    if (!isCurrent()) return;
                     try {
                         const alt = data.channel?.alternatives?.[0];
                         const transcript = alt?.transcript;
                         const isFinal = data.is_final ?? false;
-                        console.log(`[DeepgramStreaming] Transcript event — isFinal=${isFinal}, text="${transcript ?? '(empty)'}"`);
-                        if (!transcript) return;
+                        if (!transcript) {
+                            // An empty speech_final still marks the end of the speaker's turn.
+                            if (data.speech_final) this.emit('utterance_end');
+                            return;
+                        }
                         this.emit('transcript', {
                             text: transcript,
                             isFinal,
                             confidence: alt?.confidence ?? 1.0,
+                            // speech_final = Deepgram endpointing saw trailing silence after this final.
+                            speechFinal: data.speech_final === true,
                         });
                     } catch (err) {
                         console.error('[DeepgramStreaming] Parse error:', err);
                     }
                 });
 
+                // Fired after utterance_end_ms (1s) without new words — a reliable end-of-turn signal.
+                live.on(LiveTranscriptionEvents.UtteranceEnd, () => {
+                    if (isCurrent()) this.emit('utterance_end');
+                });
+
                 // Flush buffered audio
                 const buffered = this.buffer.splice(0);
                 for (const chunk of buffered) {
-                    try { this.live?.send(chunk); } catch { }
+                    try { live.send(chunk); } catch { }
                 }
                 if (buffered.length > 0) {
                     console.log(`[DeepgramStreaming] Flushed ${buffered.length} buffered chunks`);
                 }
 
                 // SDK keepAlive() every 8s prevents idle timeout (per Deepgram docs)
+                if (this.keepAliveInterval) clearInterval(this.keepAliveInterval);
                 this.keepAliveInterval = setInterval(() => {
-                    if (this.isOpen) {
-                        try { this.live?.keepAlive(); } catch { }
+                    if (isCurrent() && this.isOpen) {
+                        try { live.keepAlive(); } catch { }
                     }
                 }, KEEPALIVE_INTERVAL_MS);
 
                 // Reset backoff only after 5s of stable connection
                 setTimeout(() => {
-                    if (this.isOpen) this.reconnectAttempts = 0;
+                    if (isCurrent() && this.isOpen) this.reconnectAttempts = 0;
                 }, 5000);
             });
 
-            this.live.on(LiveTranscriptionEvents.Error, (err: any) => {
+            live.on(LiveTranscriptionEvents.Error, (err: any) => {
+                if (!isCurrent()) return;
                 console.error('[DeepgramStreaming] Error:', err);
-                this.emit('error', err instanceof Error ? err : new Error(String(err)));
+                this.emit('error', err instanceof Error ? err : new Error(String(err?.message ?? err)));
             });
 
-            this.live.on(LiveTranscriptionEvents.Close, (event: any) => {
+            live.on(LiveTranscriptionEvents.Close, (event: any) => {
+                if (!isCurrent()) return;
                 const code = event?.code ?? 'unknown';
                 const reason = event?.reason || '(empty)';
                 console.log(`[DeepgramStreaming] Closed (code=${code}, reason=${reason})`);
 
+                this.live = null;
                 this.isOpen = false;
                 this.isConnecting = false;
                 this.clearTimers();
+
+                // Never opened on nova-3 with a non-English language → most likely a
+                // "No such model/language/tier combination" 400. Retry on nova-2.
+                if (!opened && model === 'nova-3' && this.languageCode !== 'en' && !this.forceNova2) {
+                    console.warn(`[DeepgramStreaming] nova-3 rejected lang=${this.languageCode}; falling back to nova-2`);
+                    this.forceNova2 = true;
+                }
 
                 if (this.shouldReconnect && code !== 1000) {
                     this.scheduleReconnect();
@@ -237,6 +282,9 @@ export class DeepgramStreamingSTT extends EventEmitter {
 
         if (this.reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
             console.error(`[DeepgramStreaming] Max reconnect attempts reached — giving up`);
+            // Stop write() from reconnecting on every chunk with no backoff.
+            // A new start() (next meeting / config change) re-arms reconnects.
+            this.shouldReconnect = false;
             this.emit('error', new Error('DeepgramStreamingSTT: max reconnect attempts exceeded'));
             return;
         }

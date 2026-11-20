@@ -194,8 +194,9 @@ impl SpeakerInput {
                 .get_mixformat()
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             let actual_rate = device_format.get_samplespersec();
+            let channels = std::cmp::max(1, device_format.get_nchannels() as usize);
             let desired_format =
-                WaveFormat::new(32, 32, &SampleType::Float, actual_rate as usize, 1, None);
+                WaveFormat::new(32, 32, &SampleType::Float, actual_rate as usize, channels, None);
 
             let (_def_time, min_time) = audio_client
                 .get_periods()
@@ -221,11 +222,11 @@ impl SpeakerInput {
                 .start_stream()
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            Ok((h_event, render_client, actual_rate, audio_client))
+            Ok((h_event, render_client, actual_rate, audio_client, channels))
         })();
 
         match init_result {
-            Ok((h_event, render_client, sample_rate, audio_client)) => {
+            Ok((h_event, render_client, sample_rate, audio_client, channels)) => {
                 let _ = init_tx.send(Ok(sample_rate));
                 loop {
                     {
@@ -243,8 +244,8 @@ impl SpeakerInput {
                     }
 
                     let mut temp_queue = VecDeque::new();
-                    // bytes_per_frame for 32-bit float mono = 4 bytes
-                    let bytes_per_frame: usize = 4; // 32-bit float, 1 channel
+                    // bytes_per_frame is 4 bytes per sample (32-bit float) * number of channels
+                    let bytes_per_frame: usize = 4 * channels;
                     if let Err(e) =
                         render_client.read_from_device_to_deque(bytes_per_frame, &mut temp_queue)
                     {
@@ -256,16 +257,21 @@ impl SpeakerInput {
                         continue;
                     }
 
-                    let mut samples = Vec::with_capacity(temp_queue.len() / 4);
-                    while temp_queue.len() >= 4 {
-                        let bytes = [
-                            temp_queue.pop_front().unwrap(),
-                            temp_queue.pop_front().unwrap(),
-                            temp_queue.pop_front().unwrap(),
-                            temp_queue.pop_front().unwrap(),
-                        ];
-                        let sample = f32::from_le_bytes(bytes);
-                        samples.push(sample);
+                    let mut samples = Vec::with_capacity(temp_queue.len() / (4 * channels));
+                    while temp_queue.len() >= 4 * channels {
+                        let mut frame_sum = 0.0f32;
+                        for _ in 0..channels {
+                            let bytes = [
+                                temp_queue.pop_front().unwrap(),
+                                temp_queue.pop_front().unwrap(),
+                                temp_queue.pop_front().unwrap(),
+                                temp_queue.pop_front().unwrap(),
+                            ];
+                            let sample = f32::from_le_bytes(bytes);
+                            frame_sum += sample;
+                        }
+                        let mono_sample = frame_sum / (channels as f32);
+                        samples.push(mono_sample);
                     }
 
                     if !samples.is_empty() {

@@ -72,7 +72,7 @@ export interface ElectronAPI {
   onOpenSettingsTab: (callback: (tab: string) => void) => () => void
 
   // LLM Model Management
-  getCurrentLlmConfig: () => Promise<{ provider: "ollama" | "gemini" | "custom" | "codex-cli"; model: string; isOllama: boolean }>
+  getCurrentLlmConfig: () => Promise<{ provider: "ollama" | "gemini" | "custom" | "codex-cli" | "azure-openai"; model: string; isOllama: boolean }>
   getAvailableOllamaModels: () => Promise<string[]>
   switchToOllama: (model?: string, url?: string) => Promise<{ success: boolean; error?: string }>
   switchToGemini: (apiKey?: string, modelId?: string) => Promise<{ success: boolean; error?: string }>
@@ -86,7 +86,7 @@ export interface ElectronAPI {
   setClaudeApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   setNativelyApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>
   getNativelyUsage: () => Promise<{ ok: boolean; error?: string; plan?: string; quota?: { transcription: { used: number; limit: number; remaining: number }; ai: { used: number; limit: number; remaining: number }; search: { used: number; limit: number; remaining: number }; resets_at: string }; member_since?: string }>
-  getStoredCredentials: () => Promise<{ hasNativelyKey?: boolean; hasGeminiKey: boolean; hasGroqKey: boolean; hasOpenaiKey: boolean; hasClaudeKey: boolean; googleServiceAccountPath: string | null; sttProvider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively'; hasSttGroqKey: boolean; hasSttOpenaiKey: boolean; hasDeepgramKey: boolean; hasElevenLabsKey: boolean; hasAzureKey: boolean; azureRegion: string; hasIbmWatsonKey: boolean; ibmWatsonRegion: string; groqSttModel?: string; hasSonioxKey?: boolean; hasTavilyKey?: boolean; geminiPreferredModel?: string; groqPreferredModel?: string; openaiPreferredModel?: string; claudePreferredModel?: string; sttGroqKey?: string; sttOpenaiKey?: string; sttDeepgramKey?: string; sttElevenLabsKey?: string; sttAzureKey?: string; sttIbmKey?: string; sttSonioxKey?: string; openAiSttBaseUrl?: string }>
+  getStoredCredentials: () => Promise<{ hasNativelyKey?: boolean; hasGeminiKey: boolean; hasGroqKey: boolean; hasOpenaiKey: boolean; hasAzureOpenaiKey?: boolean; azureOpenaiDeployment?: string; azureOpenaiModelId?: string; hasClaudeKey: boolean; googleServiceAccountPath: string | null; sttProvider: 'none' | 'google' | 'groq' | 'openai' | 'deepgram' | 'elevenlabs' | 'azure' | 'ibmwatson' | 'soniox' | 'natively'; hasSttGroqKey: boolean; hasSttOpenaiKey: boolean; hasDeepgramKey: boolean; hasElevenLabsKey: boolean; hasAzureKey: boolean; azureRegion: string; hasIbmWatsonKey: boolean; ibmWatsonRegion: string; groqSttModel?: string; hasSonioxKey?: boolean; hasTavilyKey?: boolean; geminiPreferredModel?: string; groqPreferredModel?: string; openaiPreferredModel?: string; claudePreferredModel?: string; sttGroqKey?: string; sttOpenaiKey?: string; sttDeepgramKey?: string; sttElevenLabsKey?: string; sttAzureKey?: string; sttIbmKey?: string; sttSonioxKey?: string; openAiSttBaseUrl?: string }>
   // Permissions
   checkPermissions:     () => Promise<{ microphone: 'granted'|'denied'|'not-determined'|'restricted'; screen: 'granted'|'denied'|'not-determined'|'restricted'; platform: string }>
   requestMicPermission: () => Promise<boolean>
@@ -135,6 +135,8 @@ export interface ElectronAPI {
   getAiResponseLanguages: () => Promise<Array<{ label: string; code: string }>>
   setAiResponseLanguage: (language: string) => Promise<{ success: boolean; error?: string }>
   getSttLanguage: () => Promise<string>
+  getInterviewerSttLanguage: () => Promise<string>
+  setInterviewerRecognitionLanguage: (key: string) => Promise<{ success: boolean; error?: string }>
   getAiResponseLanguage: () => Promise<string>
   onSttLanguageAutoDetected: (callback: (bcp47: string) => void) => () => void
   onSystemAudioPermissionDenied: (callback: (message: string) => void) => () => void
@@ -233,6 +235,8 @@ export interface ElectronAPI {
   toggleSettingsWindow: (coords?: { x: number; y: number }) => Promise<void>;
 
   // Groq Fast Text Mode
+  getAutoReplySettings: () => Promise<{ autoReplyOnFinal: boolean; speculativeAnswers: boolean }>;
+  setAutoReplySettings: (patch: { autoReplyOnFinal?: boolean; speculativeAnswers?: boolean }) => Promise<{ success: boolean; autoReplyOnFinal?: boolean; speculativeAnswers?: boolean; error?: string }>;
   getGroqFastTextMode: () => Promise<{ enabled: boolean }>;
   setGroqFastTextMode: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
   getCodexCliConfig: () => Promise<{ enabled: boolean; path: string; model: string; fastModel: string; timeoutMs: number }>;
@@ -257,6 +261,10 @@ export interface ElectronAPI {
   startAudioTest: (deviceId?: string) => Promise<{ success: boolean }>;
   stopAudioTest: () => Promise<{ success: boolean }>;
   onAudioTestLevel: (callback: (level: number) => void) => () => void;
+  startSystemAudioTest: (deviceId?: string) => Promise<{ success: boolean }>;
+  stopSystemAudioTest: () => Promise<{ success: boolean }>;
+  onSystemAudioTestLevel: (callback: (level: number) => void) => () => void;
+  checkDesktopCapture: () => Promise<{ success: boolean; count: number; sources?: Array<{ id: string; name: string }>; error?: string }>;
 
   // Database
   flushDatabase: () => Promise<{ success: boolean }>;
@@ -339,7 +347,7 @@ export interface ElectronAPI {
   onStealthKeyCaptured: (cb: (ev: { keyCode: number; chars: string; flags: number; isKeyDown: boolean }) => void) => () => void
 
   // Profile Engine API
-  profileUploadResume: (filePath: string) => Promise<{ success: boolean; error?: string }>
+  profileUploadResume: (filePath: string) => Promise<{ success: boolean; error?: string; state?: any }>
   profileGetStatus: () => Promise<{ hasProfile: boolean; profileMode: boolean; name?: string; role?: string; totalExperienceYears?: number }>
   profileSetMode: (enabled: boolean) => Promise<{ success: boolean; error?: string }>
   profileDelete: () => Promise<{ success: boolean; error?: string }>
@@ -347,14 +355,23 @@ export interface ElectronAPI {
   profileSelectFile: () => Promise<{ success?: boolean; cancelled?: boolean; filePath?: string; error?: string }>
 
   // JD & Research API
-  profileUploadJD: (filePath: string) => Promise<{ success: boolean; error?: string }>
+  profileUploadJD: (filePath: string) => Promise<{ success: boolean; error?: string; state?: any }>
   profileDeleteJD: () => Promise<{ success: boolean; error?: string }>
   profileResearchCompany: (companyName: string) => Promise<{ success: boolean; dossier?: any; error?: string; searchQuotaExhausted?: boolean }>
   profileGenerateNegotiation: (force?: boolean) => Promise<{ success: boolean; script?: any; error?: string }>
   profileGetNegotiationState: () => Promise<{ success: boolean; state?: any; isActive?: boolean; error?: string }>
   profileResetNegotiation: () => Promise<{ success: boolean; error?: string }>
-  profileGetNotes: () => Promise<{ success: boolean; content: string; error?: string }>
-  profileSaveNotes: (content: string) => Promise<{ success: boolean; error?: string }>
+  profileSemanticSearch: (query: string, limit?: number) => Promise<{ success: boolean; results?: Array<{ category: string; title: string; snippet: string; score: number }>; error?: string }>
+  profileGetNotes: () => Promise<{ success: boolean; content: string; notes?: string; error?: string }>
+  profileSaveNotes: (content: string) => Promise<{ success: boolean; content?: string; notes?: string; error?: string }>
+
+  // Career Intelligence API aliases
+  resumeUpload: (filePath: string) => Promise<{ success: boolean; error?: string; state?: any }>
+  jdUpload: (filePath: string) => Promise<{ success: boolean; error?: string; state?: any }>
+  companyResearch: (input: string | { companyName?: string }) => Promise<{ success: boolean; dossier?: any; error?: string; searchQuotaExhausted?: boolean }>
+  salaryAnalyze: (input?: { force?: boolean }) => Promise<{ success: boolean; report?: any; script?: any; error?: string }>
+  contextQuery: (input: string | { query?: string; limit?: number }) => Promise<{ success: boolean; query?: string; answer?: string; context?: string; results?: any[]; error?: string }>
+  profileState: () => Promise<{ success: boolean; status?: any; profile?: any; negotiation?: any; companyDossier?: any; resume?: any; jobDescription?: any; error?: string }>
 
   // Tavily Search API
   setTavilyApiKey: (apiKey: string) => Promise<{ success: boolean; error?: string }>

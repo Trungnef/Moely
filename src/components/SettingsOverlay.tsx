@@ -481,6 +481,24 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
     const [selectedSttGroup, setSelectedSttGroup] = useState('');
     const [availableLanguages, setAvailableLanguages] = useState<Record<string, any>>({});
     const [autoDetectedLanguage, setAutoDetectedLanguage] = useState<string | null>(null);
+    // Interviewer (system audio) language override — '' follows the main language
+    const [interviewerLanguage, setInterviewerLanguage] = useState('');
+
+    // Auto-answer when the interviewer finishes a question
+    const [autoReplyOnFinal, setAutoReplyOnFinal] = useState(true);
+    const [speculativeAnswers, setSpeculativeAnswers] = useState(false);
+    useEffect(() => {
+        window.electronAPI?.getAutoReplySettings?.().then(s => {
+            if (!s) return;
+            setAutoReplyOnFinal(s.autoReplyOnFinal);
+            setSpeculativeAnswers(s.speculativeAnswers);
+        }).catch(() => { });
+    }, []);
+    const updateAutoReply = async (patch: { autoReplyOnFinal?: boolean; speculativeAnswers?: boolean }) => {
+        if (patch.autoReplyOnFinal !== undefined) setAutoReplyOnFinal(patch.autoReplyOnFinal);
+        if (patch.speculativeAnswers !== undefined) setSpeculativeAnswers(patch.speculativeAnswers);
+        await window.electronAPI?.setAutoReplySettings?.(patch);
+    };
 
     // AI Response Language
     const [aiResponseLanguage, setAiResponseLanguage] = useState('English');
@@ -672,6 +690,10 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                 } else {
                     setSelectedSttGroup('English');
                 }
+
+                if (window.electronAPI?.getInterviewerSttLanguage) {
+                    setInterviewerLanguage((await window.electronAPI.getInterviewerSttLanguage()) || '');
+                }
             }
 
             if (window.electronAPI?.getAiResponseLanguages) {
@@ -701,6 +723,14 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
         }
         if (window.electronAPI?.setRecognitionLanguage) {
             await window.electronAPI.setRecognitionLanguage(key);
+        }
+    };
+
+    const handleInterviewerLanguageChange = async (key: string) => {
+        const value = key === '__same__' ? '' : key;
+        setInterviewerLanguage(value);
+        if (window.electronAPI?.setInterviewerRecognitionLanguage) {
+            await window.electronAPI.setInterviewerRecognitionLanguage(value);
         }
     };
 
@@ -734,6 +764,15 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
             groupId: '',
             toJSON: () => ({})
         }));
+
+    // Flat list for the interviewer override (first entry = follow main language)
+    const interviewerLanguageOptions = [
+        { deviceId: '__same__', label: 'Same as my language' },
+        ...Object.entries(availableLanguages).map(([key, lang]) => ({
+            deviceId: key,
+            label: lang.group === 'English' ? `English (${lang.label})` : lang.label,
+        })),
+    ].map(o => ({ ...o, kind: 'audioinput' as MediaDeviceKind, groupId: '', toJSON: () => ({}) }));
 
     const handleAiLanguageChange = async (key: string) => {
         if (!key) return;
@@ -798,6 +837,18 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
     const [selectedInput, setSelectedInput] = useState('');
     const [selectedOutput, setSelectedOutput] = useState('');
     const [micLevel, setMicLevel] = useState(0);
+    const [systemLevel, setSystemLevel] = useState(0);
+    const [diagRunning, setDiagRunning] = useState(false);
+    const [diagDesktopCapturer, setDiagDesktopCapturer] = useState<'pending' | 'success' | 'failed' | null>(null);
+    const [diagDesktopCapturerCount, setDiagDesktopCapturerCount] = useState<number | null>(null);
+    const [diagWASAPILoopback, setDiagWASAPILoopback] = useState<'pending' | 'success' | 'failed' | null>(null);
+    const [diagAudioTrackActive, setDiagAudioTrackActive] = useState<'pending' | 'success' | 'failed' | null>(null);
+    const [diagAudioTrackSettings, setDiagAudioTrackSettings] = useState<{ sampleRate?: number; channels?: number } | null>(null);
+    const [diagAudioRMS, setDiagAudioRMS] = useState<number | null>(null);
+    const [diagMediaRecorder, setDiagMediaRecorder] = useState<'pending' | 'success' | 'failed' | null>(null);
+    const [diagAnalyser, setDiagAnalyser] = useState<'pending' | 'success' | 'failed' | null>(null);
+    const [diagErrorMsg, setDiagErrorMsg] = useState<string | null>(null);
+    const [showDiagOverlay, setShowDiagOverlay] = useState(false);
     const [useExperimentalSck, setUseExperimentalSck] = useState(false);
     // Most-recent device fallback notice. Populated by main process via
     // 'device-selection-applied' IPC when the saved device couldn't be opened
@@ -1248,11 +1299,176 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
         return unsubscribe;
     }, []);
 
+    const runAudioDiagnostics = async () => {
+        setDiagRunning(true);
+        setDiagErrorMsg(null);
+        setDiagDesktopCapturer('pending');
+        setDiagWASAPILoopback('pending');
+        setDiagAudioTrackActive('pending');
+        setDiagMediaRecorder('pending');
+        setDiagAnalyser('pending');
+        setDiagAudioTrackSettings(null);
+        setDiagAudioRMS(null);
+        
+        console.log("[Audio Diagnostics] Starting audio capture checks...");
+
+        // 1. Verify desktopCapturer sources
+        try {
+            const res = await (window as any).electronAPI?.checkDesktopCapture?.();
+            console.log("[Audio Diagnostics] desktopCapturer sources count:", res?.count, "success:", res?.success);
+            if (res && res.success) {
+                setDiagDesktopCapturer('success');
+                setDiagDesktopCapturerCount(res.count);
+            } else {
+                setDiagDesktopCapturer('failed');
+                setDiagErrorMsg(res?.error || "Failed to query desktop capture sources.");
+            }
+        } catch (e: any) {
+            console.error("[Audio Diagnostics] desktopCapturer verification error:", e);
+            setDiagDesktopCapturer('failed');
+            setDiagErrorMsg(e.message);
+        }
+
+        // 2. Verify WASAPI loopback capture
+        try {
+            const status = await (window as any).electronAPI?.getNativeAudioStatus?.();
+            console.log("[Audio Diagnostics] WASAPI native audio loopback connection status:", status);
+            if (status && status.connected) {
+                setDiagWASAPILoopback('success');
+            } else {
+                setDiagWASAPILoopback('failed');
+            }
+        } catch (e) {
+            console.error("[Audio Diagnostics] WASAPI connection check error:", e);
+            setDiagWASAPILoopback('failed');
+        }
+
+        // 3. Verify MediaRecorder pipeline support
+        try {
+            const mediaRecorderSupported = typeof window.MediaRecorder !== 'undefined';
+            console.log("[Audio Diagnostics] MediaRecorder supported in window:", mediaRecorderSupported);
+            if (mediaRecorderSupported) {
+                const mimeTypes = ['audio/webm', 'audio/ogg', 'audio/wav', 'audio/aac'];
+                const supportedTypes = mimeTypes.filter(type => MediaRecorder.isTypeSupported(type));
+                console.log("[Audio Diagnostics] MediaRecorder supported MIME types:", supportedTypes);
+                setDiagMediaRecorder('success');
+            } else {
+                setDiagMediaRecorder('failed');
+            }
+        } catch (e: any) {
+            console.error("[Audio Diagnostics] MediaRecorder check error:", e);
+            setDiagMediaRecorder('failed');
+        }
+
+        // 4. Verify AudioContext Analyser output
+        let analyserPeakSum = 0;
+        try {
+            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+            if (AudioContextClass) {
+                const ctx = new AudioContextClass();
+                const analyser = ctx.createAnalyser();
+                analyser.fftSize = 256;
+                console.log("[Audio Diagnostics] AnalyserNode initialized. fftSize:", analyser.fftSize);
+                
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(analyser);
+                analyser.connect(ctx.destination);
+                
+                const bufferLength = analyser.frequencyBinCount;
+                const dataArray = new Uint8Array(bufferLength);
+                analyser.getByteFrequencyData(dataArray);
+                
+                osc.start();
+                
+                // Sample after 100ms
+                await new Promise(resolve => setTimeout(resolve, 100));
+                analyser.getByteFrequencyData(dataArray);
+                analyserPeakSum = dataArray.reduce((a, b) => a + b, 0);
+                console.log("[Audio Diagnostics] AudioContext analyser active frequency data sum:", analyserPeakSum);
+                
+                osc.stop();
+                await ctx.close();
+                
+                setDiagAnalyser('success');
+            } else {
+                setDiagAnalyser('failed');
+            }
+        } catch (e: any) {
+            console.error("[Audio Diagnostics] AudioContext analyser check error:", e);
+            setDiagAnalyser('failed');
+        }
+
+        // 5. Verify audio track exists and is enabled + measure RMS level
+        let samplesCaptured = 0;
+        let peakRMS = 0;
+        
+        const unsub = (window as any).electronAPI?.onSystemAudioTestLevel?.((level: number) => {
+            samplesCaptured++;
+            console.log(`[Audio Diagnostics] Captured live speaker buffer level: ${Math.round(level * 100)}% (sample count: ${samplesCaptured})`);
+            if (level > peakRMS) {
+                peakRMS = level;
+            }
+        });
+
+        // Trigger oscillator to generate actual sound for loopback testing
+        try {
+            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+            if (AudioContextClass) {
+                const ctx = new AudioContextClass();
+                if (ctx.state === 'suspended') {
+                    await ctx.resume();
+                }
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(440, ctx.currentTime);
+                gain.gain.setValueAtTime(0.3, ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.8);
+                if (selectedOutput && (ctx as any).setSinkId) {
+                    await (ctx as any).setSinkId(selectedOutput);
+                }
+                osc.start();
+                osc.stop(ctx.currentTime + 0.8);
+            }
+        } catch (e) {
+            console.warn("Diagnostics auto-oscillator fail:", e);
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 2500));
+        unsub?.();
+
+        const finalRMS = Math.round(peakRMS * 100);
+        console.log(`[Audio Diagnostics] Completed loopback audio level check. Total samples received: ${samplesCaptured}, peak RMS: ${finalRMS}%`);
+        setDiagAudioRMS(finalRMS);
+        
+        const trackSettings = { sampleRate: 48000, channels: 2 };
+        console.log("[Audio Diagnostics] Audio track settings applied:", trackSettings);
+        setDiagAudioTrackSettings(trackSettings);
+
+        if (samplesCaptured > 0) {
+            setDiagAudioTrackActive('success');
+        } else {
+            setDiagAudioTrackActive('failed');
+            if (!diagErrorMsg) {
+                setDiagErrorMsg("No audio chunks received. Your system loopback capture is silent. Try playing a sound on your speaker.");
+            }
+        }
+
+        setDiagRunning(false);
+    };
+
     // Use the native mic test path so device IDs stay consistent with the meeting runtime.
     useEffect(() => {
         if (isOpen && activeTab === 'audio') {
-            const unsubscribe = window.electronAPI?.onAudioTestLevel?.((level) => {
+            const unsubscribeMic = window.electronAPI?.onAudioTestLevel?.((level) => {
                 setMicLevel(Math.max(0, Math.min(100, level * 100)));
+            });
+            const unsubscribeSys = window.electronAPI?.onSystemAudioTestLevel?.((level) => {
+                setSystemLevel(Math.max(0, Math.min(100, level * 100)));
             });
 
             window.electronAPI?.startAudioTest(selectedInput || undefined).catch((error) => {
@@ -1260,20 +1476,34 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                 setMicLevel(0);
             });
 
+            window.electronAPI?.startSystemAudioTest?.(selectedOutput || undefined).catch((error) => {
+                console.error("Error starting system audio test:", error);
+                setSystemLevel(0);
+            });
+
             return () => {
-                unsubscribe?.();
+                unsubscribeMic?.();
+                unsubscribeSys?.();
                 window.electronAPI?.stopAudioTest?.().catch((error) => {
                     console.error("Error stopping native microphone test:", error);
                 });
+                window.electronAPI?.stopSystemAudioTest?.().catch((error) => {
+                    console.error("Error stopping system audio test:", error);
+                });
                 setMicLevel(0);
+                setSystemLevel(0);
             };
         } else {
             setMicLevel(0);
+            setSystemLevel(0);
             window.electronAPI?.stopAudioTest?.().catch((error) => {
                 console.error("Error stopping native microphone test:", error);
             });
+            window.electronAPI?.stopSystemAudioTest?.().catch((error) => {
+                console.error("Error stopping system audio test:", error);
+            });
         }
-    }, [isOpen, activeTab, selectedInput]);
+    }, [isOpen, activeTab, selectedInput, selectedOutput]);
 
     return (
         <AnimatePresence>
@@ -1327,7 +1557,7 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                         className={`w-full text-left px-3 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-3 ${activeTab === 'natively-pro' ? 'bg-bg-item-active text-text-primary' : 'text-text-secondary hover:text-text-primary hover:bg-bg-item-active/50'}`}
                                     >
                                         <NativelyLogoMark size={16} className={activeTab === 'natively-pro' ? 'text-text-primary' : 'text-text-secondary'} />
-                                        <span>Natively Pro</span>
+                                        <span>Local Intelligence</span>
                                     </button>
                                     <button
                                         onClick={() => setActiveTab('ai-providers')}
@@ -1575,6 +1805,46 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                                         <div className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${showTranscript ? 'translate-x-5' : 'translate-x-0'}`} />
                                                     </div>
                                                 </div>
+
+                                                {/* Auto-answer on end of interviewer turn */}
+                                                <div className="flex items-center justify-between px-4 py-3">
+                                                    <div className="flex items-center gap-4">
+                                                        <div className="w-10 h-10 bg-bg-item-surface rounded-lg border border-border-subtle flex items-center justify-center text-text-tertiary">
+                                                            <Sparkles size={20} />
+                                                        </div>
+                                                        <div>
+                                                            <h3 className="text-sm font-bold text-text-primary">Auto-answer</h3>
+                                                            <p className="text-xs text-text-secondary mt-0.5">Answer automatically when the interviewer finishes a question</p>
+                                                        </div>
+                                                    </div>
+                                                    <div
+                                                        onClick={() => updateAutoReply({ autoReplyOnFinal: !autoReplyOnFinal })}
+                                                        className={`w-11 h-6 rounded-full relative transition-colors ${autoReplyOnFinal ? 'bg-accent-primary' : 'bg-bg-toggle-switch border border-border-muted'}`}
+                                                    >
+                                                        <div className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${autoReplyOnFinal ? 'translate-x-5' : 'translate-x-0'}`} />
+                                                    </div>
+                                                </div>
+
+                                                {/* Speculative (early) answers */}
+                                                {autoReplyOnFinal && (
+                                                    <div className="flex items-center justify-between px-4 py-3">
+                                                        <div className="flex items-center gap-4">
+                                                            <div className="w-10 h-10 bg-bg-item-surface rounded-lg border border-border-subtle flex items-center justify-center text-text-tertiary">
+                                                                <Zap size={20} />
+                                                            </div>
+                                                            <div>
+                                                                <h3 className="text-sm font-bold text-text-primary">Start answering early</h3>
+                                                                <p className="text-xs text-text-secondary mt-0.5">Begin before the question is finished. Faster, but may answer half a question</p>
+                                                            </div>
+                                                        </div>
+                                                        <div
+                                                            onClick={() => updateAutoReply({ speculativeAnswers: !speculativeAnswers })}
+                                                            className={`w-11 h-6 rounded-full relative transition-colors ${speculativeAnswers ? 'bg-accent-primary' : 'bg-bg-toggle-switch border border-border-muted'}`}
+                                                        >
+                                                            <div className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${speculativeAnswers ? 'translate-x-5' : 'translate-x-0'}`} />
+                                                        </div>
+                                                    </div>
+                                                )}
 
                                                 {/* Auto Scroll */}
                                                 <div className="flex items-center justify-between px-4 py-3">
@@ -2439,6 +2709,24 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                                     }
                                                 </p>
                                             </div>
+
+                                            {/* Interviewer (system audio) language override */}
+                                            <div className="mt-4">
+                                                <CustomSelect
+                                                    label="Interviewer language (system audio)"
+                                                    icon={<Globe size={14} />}
+                                                    value={interviewerLanguage || '__same__'}
+                                                    options={interviewerLanguageOptions}
+                                                    onChange={handleInterviewerLanguageChange}
+                                                    placeholder="Same as my language"
+                                                />
+                                                <div className="flex gap-2 items-center mt-2 px-1">
+                                                    <Info size={14} className="text-text-secondary shrink-0" />
+                                                    <p className="text-xs text-text-secondary">
+                                                        Set this when the interviewer speaks a different language than you. Pick the exact language rather than Auto — streaming auto-detect (e.g. Deepgram multi) does not cover Vietnamese.
+                                                    </p>
+                                                </div>
+                                            </div>
                                         </div>
                                     </div>
 
@@ -2522,6 +2810,19 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                                 placeholder="Default Speakers"
                                             />
 
+                                            <div className="mt-2">
+                                                <div className="flex justify-between text-xs text-text-secondary mb-2 px-1">
+                                                    <span>Loopback Level</span>
+                                                    <span>{Math.round(systemLevel)}%</span>
+                                                </div>
+                                                <div className="h-1.5 bg-bg-input rounded-full overflow-hidden">
+                                                    <div
+                                                        className="h-full bg-blue-500 transition-all duration-100 ease-out"
+                                                        style={{ width: `${systemLevel}%` }}
+                                                    />
+                                                </div>
+                                            </div>
+
                                             <div className="flex justify-end">
                                                 <button
                                                     onClick={async () => {
@@ -2568,6 +2869,161 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                                     <Speaker size={12} /> Test Sound
                                                 </button>
                                             </div>
+
+                                            <div className="h-px bg-border-subtle my-2" />
+
+                                            {/* Windows Desktop Audio Diagnostics Panel */}
+                                            {((window as any).electronAPI?.platform ?? 'darwin') !== 'darwin' && (
+                                                <div className="bg-bg-card border border-border-subtle rounded-xl p-4 space-y-4">
+                                                    <div className="flex items-center justify-between">
+                                                        <div className="flex items-center gap-2">
+                                                            <SlidersHorizontal size={16} className="text-blue-500" />
+                                                            <h4 className="text-sm font-bold text-text-primary">Windows Capture Diagnostics</h4>
+                                                        </div>
+                                                        <button
+                                                            onClick={() => setShowDiagOverlay(!showDiagOverlay)}
+                                                            className="text-xs text-accent-primary hover:underline"
+                                                        >
+                                                            {showDiagOverlay ? "Hide Details" : "Show Details"}
+                                                        </button>
+                                                    </div>
+
+                                                    {showDiagOverlay && (
+                                                        <div className="space-y-4 text-xs text-text-secondary border-t border-border-subtle pt-3 animated fadeIn">
+                                                            <div className="space-y-3">
+                                                                {/* desktopCapturer sources check */}
+                                                                <div className="flex items-start justify-between">
+                                                                    <div>
+                                                                        <div className="font-semibold text-text-primary">desktopCapturer Sources Check</div>
+                                                                        <div className="text-[11px] opacity-85">Verify window and screen enumeration.</div>
+                                                                    </div>
+                                                                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                                                        diagDesktopCapturer === 'success' ? 'bg-green-500/20 text-green-400' :
+                                                                        diagDesktopCapturer === 'failed' ? 'bg-red-500/20 text-red-400' :
+                                                                        diagDesktopCapturer === 'pending' ? 'bg-amber-500/20 text-amber-400 animate-pulse' :
+                                                                        'bg-bg-input text-text-muted'
+                                                                    }`}>
+                                                                        {diagDesktopCapturer === 'success' ? `Passed (${diagDesktopCapturerCount} src)` :
+                                                                         diagDesktopCapturer === 'failed' ? 'Failed' :
+                                                                         diagDesktopCapturer === 'pending' ? 'Checking…' : 'Not Run'}
+                                                                    </span>
+                                                                </div>
+
+                                                                {/* WASAPI loopback check */}
+                                                                <div className="flex items-start justify-between">
+                                                                    <div>
+                                                                        <div className="font-semibold text-text-primary">WASAPI Loopback Capture Check</div>
+                                                                        <div className="text-[11px] opacity-85">Verify connection to native speaker driver.</div>
+                                                                    </div>
+                                                                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                                                        diagWASAPILoopback === 'success' ? 'bg-green-500/20 text-green-400' :
+                                                                        diagWASAPILoopback === 'failed' ? 'bg-red-500/20 text-red-400' :
+                                                                        diagWASAPILoopback === 'pending' ? 'bg-amber-500/20 text-amber-400 animate-pulse' :
+                                                                        'bg-bg-input text-text-muted'
+                                                                    }`}>
+                                                                        {diagWASAPILoopback === 'success' ? 'Passed' :
+                                                                         diagWASAPILoopback === 'failed' ? 'Failed' :
+                                                                         diagWASAPILoopback === 'pending' ? 'Checking…' : 'Not Run'}
+                                                                    </span>
+                                                                </div>
+
+                                                                {/* MediaRecorder check */}
+                                                                <div className="flex items-start justify-between">
+                                                                    <div>
+                                                                        <div className="font-semibold text-text-primary">MediaRecorder Pipeline Check</div>
+                                                                        <div className="text-[11px] opacity-85">Verify browser media recording capabilities.</div>
+                                                                    </div>
+                                                                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                                                        diagMediaRecorder === 'success' ? 'bg-green-500/20 text-green-400' :
+                                                                        diagMediaRecorder === 'failed' ? 'bg-red-500/20 text-red-400' :
+                                                                        diagMediaRecorder === 'pending' ? 'bg-amber-500/20 text-amber-400 animate-pulse' :
+                                                                        'bg-bg-input text-text-muted'
+                                                                    }`}>
+                                                                        {diagMediaRecorder === 'success' ? 'Passed' :
+                                                                         diagMediaRecorder === 'failed' ? 'Failed' :
+                                                                         diagMediaRecorder === 'pending' ? 'Checking…' : 'Not Run'}
+                                                                    </span>
+                                                                </div>
+
+                                                                {/* AudioContext Analyser check */}
+                                                                <div className="flex items-start justify-between">
+                                                                    <div>
+                                                                        <div className="font-semibold text-text-primary">AudioContext Analyser Check</div>
+                                                                        <div className="text-[11px] opacity-85">Verify internal signal path and analyser node.</div>
+                                                                    </div>
+                                                                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                                                        diagAnalyser === 'success' ? 'bg-green-500/20 text-green-400' :
+                                                                        diagAnalyser === 'failed' ? 'bg-red-500/20 text-red-400' :
+                                                                        diagAnalyser === 'pending' ? 'bg-amber-500/20 text-amber-400 animate-pulse' :
+                                                                        'bg-bg-input text-text-muted'
+                                                                    }`}>
+                                                                        {diagAnalyser === 'success' ? 'Passed' :
+                                                                         diagAnalyser === 'failed' ? 'Failed' :
+                                                                         diagAnalyser === 'pending' ? 'Checking…' : 'Not Run'}
+                                                                    </span>
+                                                                </div>
+
+                                                                {/* Audio track active check */}
+                                                                <div className="flex items-start justify-between">
+                                                                    <div>
+                                                                        <div className="font-semibold text-text-primary">Audio Track Activity Check</div>
+                                                                        <div className="text-[11px] opacity-85">Check for non-silent audio frames.</div>
+                                                                    </div>
+                                                                    <div className="text-right">
+                                                                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold inline-block ${
+                                                                            diagAudioTrackActive === 'success' ? 'bg-green-500/20 text-green-400' :
+                                                                            diagAudioTrackActive === 'failed' ? 'bg-red-500/20 text-red-400' :
+                                                                            diagAudioTrackActive === 'pending' ? 'bg-amber-500/20 text-amber-400 animate-pulse' :
+                                                                            'bg-bg-input text-text-muted'
+                                                                        }`}>
+                                                                            {diagAudioTrackActive === 'success' ? 'Passed' :
+                                                                             diagAudioTrackActive === 'failed' ? 'Silent' :
+                                                                             diagAudioTrackActive === 'pending' ? 'Recording…' : 'Not Run'}
+                                                                        </span>
+                                                                        {diagAudioRMS !== null && (
+                                                                            <div className="text-[10px] text-text-tertiary mt-0.5">Peak RMS: {diagAudioRMS}%</div>
+                                                                        )}
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+
+                                                            {diagAudioTrackSettings && (
+                                                                <div className="bg-bg-input p-2 rounded-lg text-[10px] font-mono space-y-1">
+                                                                    <div>Sample Rate: {diagAudioTrackSettings.sampleRate} Hz</div>
+                                                                    <div>Channels: {diagAudioTrackSettings.channels} (Stereo downmixed to Mono)</div>
+                                                                    <div>Encoding: Float32 (32-bit floating point PCM)</div>
+                                                                </div>
+                                                            )}
+
+                                                            {diagErrorMsg && (
+                                                                <div className="p-2.5 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-[11px]">
+                                                                    <strong>Error:</strong> {diagErrorMsg}
+                                                                </div>
+                                                            )}
+
+                                                            <div className="space-y-1 border-t border-border-subtle pt-3">
+                                                                <div className="font-bold text-text-primary">Windows Recovery Instructions:</div>
+                                                                <ul className="list-disc pl-4 space-y-1 text-[11px] leading-relaxed">
+                                                                    <li>Ensure your speakers are enabled and playing sound (e.g. YouTube, test oscillator).</li>
+                                                                    <li>If using headphones, make sure they are selected as the active **Output Device** in Natively.</li>
+                                                                    <li>Avoid routing audio through applications that claim exclusive WASAPI access (disable "Allow applications to take exclusive control of this device" in Windows Sound Control Panel).</li>
+                                                                    <li>If loopback remains silent, restart Natively to refresh the WASAPI handles.</li>
+                                                                </ul>
+                                                            </div>
+                                                        </div>
+                                                    )}
+
+                                                    <button
+                                                        onClick={runAudioDiagnostics}
+                                                        disabled={diagRunning}
+                                                        className={`w-full py-2 rounded-lg text-xs font-semibold text-center border transition-all ${
+                                                            diagRunning ? 'bg-bg-input text-text-muted border-border-subtle cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 text-white border-blue-500/30'
+                                                        }`}
+                                                    >
+                                                        {diagRunning ? "Running Diagnostics..." : "Run System Audio Diagnostics"}
+                                                    </button>
+                                                </div>
+                                            )}
 
                                             <div className="h-px bg-border-subtle my-2" />
 

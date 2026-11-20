@@ -75,11 +75,13 @@ export const RECOGNITION_LANGUAGES: Record<string, LanguageOption> = {
     'chinese': { label: 'Chinese (Simplified)', code: 'chinese', bcp47: 'zh-CN', iso639: 'zh', group: 'Chinese' },
     'turkish': { label: 'Turkish', code: 'turkish', bcp47: 'tr-TR', iso639: 'tr', group: 'Turkish' },
     'ukrainian': { label: 'Ukrainian', code: 'ukrainian', bcp47: 'uk-UA', iso639: 'uk', group: 'Ukrainian' },
+    'vietnamese': { label: 'Vietnamese', code: 'vietnamese', bcp47: 'vi-VN', iso639: 'vi', group: 'Vietnamese' },
 };
 
 export const AI_RESPONSE_LANGUAGES = [
     { label: 'Auto (Detect)', code: 'auto' },
     { label: 'English', code: 'English' },
+    { label: 'Vietnamese', code: 'Vietnamese' },
     { label: 'Indonesian', code: 'Indonesian' },
     { label: 'Russian', code: 'Russian' },
     { label: 'Spanish', code: 'Spanish' },

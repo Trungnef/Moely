@@ -32,7 +32,9 @@ export class WhatToAnswerLLM {
         cleanedTranscript: string,
         temporalContext?: TemporalContext,
         intentResult?: IntentResult,
-        imagePaths?: string[]
+        imagePaths?: string[],
+        question?: string,
+        sessionDigest?: string
     ): AsyncGenerator<string> {
         const MEASURE = process.env.MEASURE_LATENCY === 'true';
         let tStart = 0, tIntent = 0, tTemporal = 0, tMode = 0, tTrunc = 0, tPrompt = 0, tStream = 0;
@@ -68,7 +70,32 @@ ${history}
 </previous_responses>`);
             }
 
+            if (sessionDigest && sessionDigest.trim()) {
+                contextParts.push(`<earlier_in_interview>
+Reference only — stay consistent with it and don't repeat stories already told.
+${sessionDigest.trim().slice(0, 3000)}
+</earlier_in_interview>`);
+            }
+
             if (MEASURE) tTemporal = performance.now();
+
+            // Candidate profile (resume, JD, company, notes, query-relevant snippets).
+            // Previously only the manual chat box saw the profile, so live answers were
+            // generic and behavioral answers opened with "no experience loaded".
+            // Pure coding questions skip it — the resume only distracts there.
+            if (intentResult?.intent !== 'coding') {
+                try {
+                    const { PersonaEngine } = require('../services/PersonaEngine');
+                    const tiny = this.llmHelper.getPromptTier() === 'tiny';
+                    const profileBlock: string = PersonaEngine.getInstance().getLiveAnswerContext(
+                        question || '',
+                        tiny ? { resumeChars: 2500, jdChars: 1200 } : undefined
+                    );
+                    if (profileBlock) contextParts.unshift(profileBlock);
+                } catch (_err: any) {
+                    console.warn('[WhatToAnswerLLM] Profile context unavailable:', _err?.message);
+                }
+            }
 
             const extraContext = contextParts.join('\n\n');
 
@@ -92,13 +119,11 @@ ${history}
                 + estimateTokens(modeContextBlock);
             const workingTranscript = this.llmHelper.fitContextForCurrentModel(cleanedTranscript, reservedForFit);
 
-            // ── Step 3: Build the full message (mode context + transcript) ─────
-            // Mode context block (custom prompt + reference files) prepends the
-            // transcript so the mode's ROLE:, FOCUS AREAS, INTERVIEW STYLE etc.
-            // act as the answering context.
-            const enrichedTranscript = modeContextBlock
-                ? `${modeContextBlock}\n\nCONVERSATION:\n${workingTranscript}`
-                : workingTranscript;
+            // ── Step 3: Build the full message (context + transcript) ─────────
+            // The mode context block (custom prompt + reference files) lives in the
+            // system prompt only (Step 4). It used to be sent in both places, which
+            // doubled up to ~40k chars of reference files per request.
+            const enrichedTranscript = `CONVERSATION:\n${workingTranscript}`;
 
             const fullMessage = extraContext
                 ? `${extraContext}\n\n${enrichedTranscript}`

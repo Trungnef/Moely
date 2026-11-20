@@ -584,6 +584,117 @@ export class DatabaseManager {
             this.db.pragma('user_version = 14');
         }
 
+        // Version 14 → 15: Add persona cache/history tables
+        if (version < 15) {
+            console.log('[DatabaseManager] Applying migration v14 → v15: Add persona company/negotiation persistence tables');
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS persona_company_research_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    company_name TEXT NOT NULL,
+                    context_hash TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    dossier_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_persona_company_cache_lookup
+                ON persona_company_research_cache(company_name, context_hash);
+
+                CREATE TABLE IF NOT EXISTS persona_negotiation_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    company_name TEXT,
+                    role_title TEXT,
+                    location TEXT,
+                    years_experience REAL,
+                    inputs_json TEXT NOT NULL,
+                    output_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_persona_negotiation_history_created
+                ON persona_negotiation_history(created_at DESC);
+            `);
+            this.db.pragma('user_version = 15');
+        }
+
+        // Version 15 -> 16: Career Intelligence production tables
+        if (version < 16) {
+            console.log('[DatabaseManager] Applying migration v15 -> v16: Add career intelligence tables');
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    id TEXT PRIMARY KEY,
+                    profile_json TEXT NOT NULL,
+                    compact_summary TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS resumes (
+                    id TEXT PRIMARY KEY,
+                    file_path TEXT,
+                    content TEXT NOT NULL,
+                    parsed_json TEXT,
+                    uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS job_descriptions (
+                    id TEXT PRIMARY KEY,
+                    file_path TEXT,
+                    content TEXT NOT NULL,
+                    parsed_json TEXT,
+                    uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_type TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL DEFAULT 0,
+                    text_content TEXT NOT NULL,
+                    embedding BLOB,
+                    metadata_json TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS company_dossiers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    company_name TEXT NOT NULL,
+                    context_hash TEXT,
+                    dossier_json TEXT NOT NULL,
+                    sources_json TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS salary_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    company_name TEXT,
+                    role_title TEXT,
+                    location TEXT,
+                    inputs_json TEXT NOT NULL,
+                    report_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_resumes_uploaded_at ON resumes(uploaded_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_job_descriptions_uploaded_at ON job_descriptions(uploaded_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_embeddings_owner ON embeddings(owner_type, owner_id);
+                CREATE INDEX IF NOT EXISTS idx_company_dossiers_lookup ON company_dossiers(company_name, context_hash, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_salary_reports_created ON salary_reports(created_at DESC);
+            `);
+            this.db.pragma('user_version = 16');
+        }
+
+        // Version 16 -> 17: Ensure vec_resume_nodes_${dim} exists for all dimensions
+        if (version < 17) {
+            console.log('[DatabaseManager] Applying migration v16 -> v17: Ensure vec_resume_nodes tables exist');
+            for (const dim of DatabaseManager.KNOWN_DIMS) {
+                this.ensureVecTableForDim(dim);
+            }
+            this.db.pragma('user_version = 17');
+        }
+
         console.log('[DatabaseManager] Migrations completed.');
     }
 
@@ -887,7 +998,7 @@ export class DatabaseManager {
      * Used by the v8 migration, delete operations, and table provisioning.
      * When a new provider dimension is encountered at runtime, ensureVecTableForDim() handles it.
      */
-    public static readonly KNOWN_DIMS: readonly number[] = [768, 1536, 3072];
+    public static readonly KNOWN_DIMS: readonly number[] = [192, 768, 1536, 3072];
 
     /** Cache: dimensions for which vec0 tables have already been verified/created this session. */
     private ensuredDims = new Set<number>();
@@ -915,6 +1026,12 @@ export class DatabaseManager {
             this.db.exec(`
                 CREATE VIRTUAL TABLE IF NOT EXISTS vec_summaries_${dim} USING vec0(
                     summary_id INTEGER PRIMARY KEY,
+                    embedding float[${dim}]
+                );
+            `);
+            this.db.exec(`
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_resume_nodes_${dim} USING vec0(
+                    node_id INTEGER PRIMARY KEY,
                     embedding float[${dim}]
                 );
             `);

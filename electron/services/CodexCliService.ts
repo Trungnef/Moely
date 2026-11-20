@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import { spawn, type ChildProcess, type SpawnOptions } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -120,10 +120,10 @@ export class CodexCliService {
   // Returns the resolved path on success so callers can persist it.
   public static async validateExecutable(input: string, timeoutMs = 10_000): Promise<{ success: boolean; error?: string; resolvedPath?: string }> {
     const tryOne = (binPath: string): Promise<{ success: boolean; error?: string }> => new Promise((resolve) => {
-      const child = spawn(binPath, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const child = this.spawnCli(binPath, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
       let stderr = '';
       const timer = setTimeout(() => {
-        child.kill('SIGTERM');
+        this.terminateChild(child);
         resolve({ success: false, error: `Codex CLI validation timed out for "${binPath}".` });
       }, timeoutMs);
       child.stderr.on('data', chunk => { stderr += chunk.toString(); });
@@ -165,14 +165,14 @@ export class CodexCliService {
     if (options.signal?.aborted) throw new Error('Codex CLI request aborted before start.');
 
     const args = this.buildArgs(options.model, options.imagePaths, options.sandboxMode);
-    const child = spawn(path, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = this.spawnCli(path, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     let lineBuffer = '';
     let emitted = false;
     let aborted = false;
 
-    const timer = setTimeout(() => child.kill('SIGTERM'), options.timeoutMs);
+    const timer = setTimeout(() => this.terminateChild(child), options.timeoutMs);
 
     const queue: string[] = [];
     let finished = false;
@@ -187,7 +187,7 @@ export class CodexCliService {
 
     const onAbort = () => {
       aborted = true;
-      child.kill('SIGTERM');
+      this.terminateChild(child);
       if (!failure) failure = new Error('Codex CLI request aborted.');
       wake();
     };
@@ -279,7 +279,7 @@ export class CodexCliService {
     if (options.signal?.aborted) throw new Error('Codex CLI request aborted before start.');
 
     return new Promise((resolve, reject) => {
-      const child = spawn(path, this.buildArgs(options.model, options.imagePaths, options.sandboxMode), { stdio: ['pipe', 'pipe', 'pipe'] });
+      const child = this.spawnCli(path, this.buildArgs(options.model, options.imagePaths, options.sandboxMode), { stdio: ['pipe', 'pipe', 'pipe'] });
       let stdout = '';
       let stderr = '';
       let settled = false;
@@ -291,13 +291,13 @@ export class CodexCliService {
         fn();
       };
       const onAbort = () => {
-        child.kill('SIGTERM');
+        this.terminateChild(child);
         settle(() => reject(new Error('Codex CLI request aborted.')));
       };
       options.signal?.addEventListener('abort', onAbort, { once: true });
 
       const timer = setTimeout(() => {
-        child.kill('SIGTERM');
+        this.terminateChild(child);
         settle(() => reject(new Error(`Codex CLI timed out after ${options.timeoutMs}ms.`)));
       }, options.timeoutMs);
 
@@ -416,5 +416,25 @@ export class CodexCliService {
 
   private static sanitize(text: string): string {
     return text.replace(/\s+/g, ' ').trim().slice(0, 1000);
+  }
+
+  private static spawnCli(command: string, args: string[], options: SpawnOptions): ChildProcess {
+    const spawnOptions: SpawnOptions = { ...options, windowsHide: true };
+    if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(command)) {
+      return spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', command, ...args], spawnOptions);
+    }
+    return spawn(command, args, spawnOptions);
+  }
+
+  private static terminateChild(child: ChildProcess): void {
+    if (process.platform === 'win32' && child.pid) {
+      try {
+        spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
+        return;
+      } catch {
+        // Fall through to Node's regular kill path.
+      }
+    }
+    child.kill('SIGTERM');
   }
 }

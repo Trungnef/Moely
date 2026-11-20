@@ -105,7 +105,7 @@ export const NativelyProSettings: React.FC = () => {
         <div className="space-y-4 animated fadeIn">
             {/* Page title */}
             <div>
-                <h3 className="text-[15px] font-semibold text-text-primary tracking-[-0.01em]">Natively Pro</h3>
+                <h3 className="text-[15px] font-semibold text-text-primary tracking-[-0.01em]">Local Intelligence</h3>
                 <p className="text-[12px] text-text-tertiary mt-0.5 leading-snug">
                     Profile Engine &amp; Job Description Intelligence
                 </p>
@@ -117,9 +117,9 @@ export const NativelyProSettings: React.FC = () => {
                         <div className="w-16 h-16 rounded-[16px] bg-emerald-500/10 border border-emerald-500/20 flex flex-col items-center justify-center mb-6 shadow-inner relative group transition-transform duration-500 hover:scale-105">
                             <CheckCircle size={28} className="text-emerald-400" strokeWidth={2} />
                         </div>
-                        <h2 className="text-[18px] font-semibold tracking-tight text-text-primary">Pro License Active</h2>
+                        <h2 className="text-[18px] font-semibold tracking-tight text-text-primary">Local Intelligence Active</h2>
                         <p className="text-[13px] mt-2 max-w-[280px] mx-auto leading-relaxed mb-8 text-text-secondary">
-                            Your device is fully authorized for Natively's premium features including the Profile Engine, Job Description Intelligence, and Company Research.
+                            Profile Engine, Job Description Intelligence, Company Research, Modes, and Salary Copilot are enabled locally.
                         </p>
 
                         <button
@@ -142,7 +142,7 @@ export const NativelyProSettings: React.FC = () => {
                                 <div className="w-12 h-12 rounded-[14px] bg-yellow-500/10 border border-yellow-500/20 shadow-[inset_0_1px_rgba(255,255,255,0.06),0_2px_10px_rgba(0,0,0,0.05)] flex items-center justify-center mb-4 relative">
                                     <NativelyLogoMark size={24} className="text-white drop-shadow-sm" />
                                 </div>
-                                <h2 className="text-[17px] font-bold tracking-tight text-text-primary">Unlock Natively Pro</h2>
+                                <h2 className="text-[17px] font-bold tracking-tight text-text-primary">Local Intelligence Included</h2>
                                 <p className="text-[12.5px] mt-1.5 leading-relaxed text-text-secondary max-w-[260px]">Supercharge your workflow with advanced intelligence and candidate insights.</p>
                             </div>
 

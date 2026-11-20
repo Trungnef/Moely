@@ -18,6 +18,11 @@ export interface AppSettings {
     codexCliTimeoutMs?: number;
     codexCliSandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
     knowledgeMode?: boolean;
+    // Auto-answer once the interviewer finishes a question (end-of-turn detection). Default true.
+    autoReplyOnFinal?: boolean;
+    // Start generating on stable interim text before the turn ends (lower latency,
+    // may answer half a question). Default false. Only applies with autoReplyOnFinal.
+    speculativeAnswers?: boolean;
     phoneMirrorEnabled?: boolean;
     phoneMirrorExposeOnLan?: boolean;
     localWhisperModel?: string;

@@ -616,6 +616,22 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
         return () => unsub?.();
     }, []);
 
+    const systemAudioWarningTitle = (() => {
+        const text = systemAudioWarning?.toLowerCase() || '';
+        if (text.includes('screen recording') || text.includes('permission denied') || text.includes('tcc')) {
+            return 'Screen Recording Permission Denied';
+        }
+        if (text.includes('same device') || text.includes('airpods') || text.includes('hfp') || text.includes('output device')) {
+            return 'System Audio Route Issue';
+        }
+        return 'System Audio Not Captured';
+    })();
+
+    const shouldShowScreenRecordingSettingsButton = (() => {
+        const text = systemAudioWarning?.toLowerCase() || '';
+        return text.includes('screen recording') || text.includes('permission denied') || text.includes('tcc');
+    })();
+
     // PR #173: STT not configured warning — shown when provider is 'none' during a meeting
     const [sttNotConfigured, setSttNotConfigured] = useState(false);
     useEffect(() => {
@@ -3030,19 +3046,21 @@ Provide only the answer, nothing else.`;
                                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
                                                 </svg>
                                             </div>
-                                            <span>Screen Recording Permission Denied</span>
+                                            <span>{systemAudioWarningTitle}</span>
                                         </div>
                                         <p className="text-[11px] text-yellow-600/70 dark:text-yellow-400/60 leading-snug pl-[26px]">
                                             {systemAudioWarning}
                                         </p>
                                     </div>
                                     <div className="flex items-center gap-2 shrink-0">
-                                        <button
-                                            onClick={() => { window.electronAPI.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'); }}
-                                            className="px-3 py-1.5 rounded-lg bg-yellow-500/15 hover:bg-yellow-500/25 text-yellow-700 dark:text-yellow-500 text-[11px] font-semibold transition-all active:scale-95 border border-yellow-500/20 shadow-sm"
-                                        >
-                                            Open Settings
-                                        </button>
+                                        {shouldShowScreenRecordingSettingsButton && (
+                                            <button
+                                                onClick={() => { window.electronAPI.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'); }}
+                                                className="px-3 py-1.5 rounded-lg bg-yellow-500/15 hover:bg-yellow-500/25 text-yellow-700 dark:text-yellow-500 text-[11px] font-semibold transition-all active:scale-95 border border-yellow-500/20 shadow-sm"
+                                            >
+                                                Open Settings
+                                            </button>
+                                        )}
                                         <button
                                             onClick={() => setSystemAudioWarning(null)}
                                             className="p-1.5 rounded-full hover:bg-black/5 dark:hover:bg-white/10 text-yellow-600/50 hover:text-yellow-700 dark:text-yellow-500/50 dark:hover:text-yellow-400 transition-colors absolute top-1 right-1 opacity-0 group-hover/warning:opacity-100"

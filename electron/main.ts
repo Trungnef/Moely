@@ -6,6 +6,13 @@ if (!app.isPackaged) {
   require('dotenv').config();
 }
 
+const realEnvValue = (value?: string): string | undefined => {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  if (/^your[_-].*key[_-]here$/i.test(trimmed) || /^your_/i.test(trimmed)) return undefined;
+  return trimmed;
+};
+
 // Handle stdout/stderr errors at the process level to prevent EIO crashes
 // This is critical for Electron apps that may have their terminal detached
 process.stdout?.on?.('error', () => { });
@@ -208,7 +215,7 @@ try {
     KnowledgeOrchestratorClass = require('../premium/electron/knowledge/KnowledgeOrchestrator').KnowledgeOrchestrator;
     KnowledgeDatabaseManagerClass = require('../premium/electron/knowledge/KnowledgeDatabaseManager').KnowledgeDatabaseManager;
 } catch {
-    console.log('[Main] Knowledge modules not available — profile intelligence disabled.');
+  console.log('[Main] Premium knowledge modules not available — using local PersonaEngine profile fallback.');
 }
 
 import { CredentialsManager } from "./services/CredentialsManager"
@@ -644,8 +651,8 @@ export class AppState {
              const { CredentialsManager } = require('./services/CredentialsManager');
              const cm = CredentialsManager.getInstance();
              this.ragManager.initializeEmbeddings({
-                openaiKey: cm.getOpenaiApiKey() || process.env.OPENAI_API_KEY || undefined,
-                geminiKey: cm.getGeminiApiKey() || process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY || undefined,
+                openaiKey: cm.getOpenaiApiKey() || realEnvValue(process.env.OPENAI_API_KEY),
+                geminiKey: cm.getGeminiApiKey() || realEnvValue(process.env.GOOGLE_API_KEY) || realEnvValue(process.env.GEMINI_API_KEY),
                 ollamaUrl: process.env.OLLAMA_URL || "http://localhost:11434"
              });
           }
@@ -664,8 +671,8 @@ export class AppState {
       if (sqliteDb) {
         const { CredentialsManager } = require('./services/CredentialsManager');
         const cm = CredentialsManager.getInstance();
-        const openaiKey = cm.getOpenaiApiKey() || process.env.OPENAI_API_KEY;
-        const geminiKey = cm.getGeminiApiKey() || process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
+        const openaiKey = cm.getOpenaiApiKey() || realEnvValue(process.env.OPENAI_API_KEY);
+        const geminiKey = cm.getGeminiApiKey() || realEnvValue(process.env.GOOGLE_API_KEY) || realEnvValue(process.env.GEMINI_API_KEY);
         
         this.ragManager = new RAGManager({ 
             db: sqliteDb, 
@@ -945,13 +952,19 @@ export class AppState {
   private microphoneCapture: MicrophoneCapture | null = null;
   private audioTestCapture: MicrophoneCapture | null = null; // For audio settings test
   private _audioTestStarting = false;               // P2-12: in-flight guard against concurrent calls
+  private systemAudioTestCapture: SystemAudioCapture | null = null;
+  private _systemAudioTestStarting = false;
   private googleSTT: STTProvider | null = null; // Interviewer
   private googleSTT_User: STTProvider | null = null; // User
 
   private createSTTProvider(speaker: 'interviewer' | 'user'): STTProvider | null {
     const { CredentialsManager } = require('./services/CredentialsManager');
     const sttProvider = CredentialsManager.getInstance().getSttProvider();
-    const sttLanguage = CredentialsManager.getInstance().getSttLanguage();
+    // The interviewer (system audio) channel can be pinned to a different language
+    // than the user's mic — e.g. user answers in English, interviewer asks in Vietnamese.
+    const sttLanguage = speaker === 'interviewer'
+      ? CredentialsManager.getInstance().getSttLanguageInterviewer()
+      : CredentialsManager.getInstance().getSttLanguage();
 
     // 'none' means the user has explicitly disabled STT (no provider selected).
     // Return null so the pipeline skips STT without falling back to Google.
@@ -1064,7 +1077,7 @@ export class AppState {
     stt.setRecognitionLanguage(sttLanguage);
 
     // Wire Transcript Events
-    stt.on('transcript', (segment: { text: string, isFinal: boolean, confidence: number }) => {
+    stt.on('transcript', (segment: { text: string, isFinal: boolean, confidence: number, speechFinal?: boolean }) => {
       // Accept transcripts while a meeting is active OR while we're draining
       // trailing finals after Stop. `_isDraining` covers the ~250 ms grace
       // window between Stop click and STT socket close so the user's last
@@ -1078,7 +1091,8 @@ export class AppState {
         text: segment.text,
         timestamp: Date.now(),
         final: segment.isFinal,
-        confidence: segment.confidence
+        confidence: segment.confidence,
+        speechFinal: segment.speechFinal,
       });
 
       // Feed final transcript to JIT RAG indexer
@@ -1105,6 +1119,13 @@ export class AppState {
       if (segment.isFinal && speaker === 'interviewer') {
         this.knowledgeOrchestrator?.feedInterviewerUtterance?.(segment.text);
       }
+    });
+
+    // Provider end-of-utterance signal (Deepgram UtteranceEnd / Soniox <end>).
+    // Providers without it fall back to the engine's silence timer.
+    stt.on('utterance_end', () => {
+      if (!this.isMeetingActive) return;
+      this.intelligenceManager.handleUtteranceEnd(speaker);
     });
 
     // Consecutive failure counter — reset on any successful final transcript
@@ -1378,10 +1399,14 @@ export class AppState {
           zerofillLatched = true;
         } else if (Date.now() - firstChunkAt >= ZEROFILL_OBSERVATION_MS) {
           zerofillTriggered = true;
-          console.warn(`${prefix}SystemAudio chunks all zero-filled for ${ZEROFILL_OBSERVATION_MS / 1000}s — TCC denial suspected (Screen Recording grant may not apply to this binary).`);
+          const isMac = process.platform === 'darwin';
+          const zeroFillHint = isMac
+            ? 'System audio is being captured but every sample is silent. This usually means macOS Screen Recording permission needs to be re-granted to this build of Natively. Open System Settings → Privacy & Security → Screen Recording, toggle Natively off and back on, then restart the app. (If you recently rebuilt or updated, the previous grant may not apply.)'
+            : 'System audio is being captured but every sample is silent. Check that the meeting app is playing through the selected output device, the output is not muted, and avoid Bluetooth Hands-Free/HFP routes for system audio. Switch the meeting output to your default stereo speakers/headphones, then restart the meeting capture.';
+          console.warn(`${prefix}SystemAudio chunks all zero-filled for ${ZEROFILL_OBSERVATION_MS / 1000}s — ${isMac ? 'TCC denial suspected' : 'silent output route suspected'}.`);
           this.broadcast('audio-capture-failed', {
             channel: 'system',
-            message: 'System audio is being captured but every sample is silent. This usually means macOS Screen Recording permission needs to be re-granted to this build of Natively. Open System Settings → Privacy & Security → Screen Recording, toggle Natively off and back on, then restart the app. (If you recently rebuilt or updated, the previous grant may not apply.)',
+            message: zeroFillHint,
             attempt: 0,
             maxAttempts: 3,
             terminal: false,
@@ -2492,6 +2517,60 @@ export class AppState {
     }
   }
 
+  public startSystemAudioTest(deviceId?: string): void {
+    if (this._systemAudioTestStarting) return;
+    if (this.isMeetingActive) {
+      throw new Error('Audio test is unavailable while a meeting is active.');
+    }
+    this._systemAudioTestStarting = true;
+    try {
+      this.stopSystemAudioTest();
+      this.systemAudioTestCapture = new SystemAudioCapture(deviceId || undefined);
+      
+      this.systemAudioTestCapture.on('data', (chunk: Buffer) => {
+        const targets = [
+          this.settingsWindowHelper.getSettingsWindow(),
+          this.getWindowHelper().getLauncherWindow(),
+          this.getWindowHelper().getOverlayWindow(),
+        ].filter((win): win is BrowserWindow => !!win && !win.isDestroyed());
+
+        if (targets.length === 0) return;
+
+        let sum = 0;
+        const step = 10;
+        const len = chunk.length;
+
+        for (let i = 0; i < len; i += 2 * step) {
+          const val = chunk.readInt16LE(i);
+          sum += val * val;
+        }
+
+        const count = len / (2 * step);
+        if (count > 0) {
+          const rms = Math.sqrt(sum / count);
+          const level = Math.min(rms / 10000, 1.0);
+          for (const target of targets) {
+            target.webContents.send('system-audio-test-level', level);
+          }
+        }
+      });
+
+      this.systemAudioTestCapture.start();
+    } catch (err) {
+      console.error('[Main] Failed to start system audio test:', err);
+    } finally {
+      this._systemAudioTestStarting = false;
+    }
+  }
+
+  public stopSystemAudioTest(): void {
+    if (this.systemAudioTestCapture) {
+      console.log('[Main] Stopping System Audio Test');
+      this.systemAudioTestCapture.stop();
+      this.systemAudioTestCapture = null;
+    }
+  }
+
   public finalizeMicSTT(): void {
     // We only want to finalize the user microphone, because the context is Manual Answer
     if (this.googleSTT_User?.finalize) {
@@ -2990,15 +3069,26 @@ export class AppState {
   public setRecognitionLanguage(key: string): void {
     console.log(`[AppState] Setting recognition language to: ${key}`);
     const { CredentialsManager } = require('./services/CredentialsManager');
-    CredentialsManager.getInstance().setSttLanguage(key);
+    const creds = CredentialsManager.getInstance();
+    creds.setSttLanguage(key);
 
-    // 'auto' is only meaningful for NativelyProSTT — other providers fall back to en-US.
-    const sttProvider = CredentialsManager.getInstance().getSttProvider();
-    const effectiveKey = (key === 'auto' && sttProvider !== 'natively') ? 'english-us' : key;
+    // Pass 'auto' straight through — every provider maps it itself (Deepgram → multi,
+    // ElevenLabs/OpenAI/Soniox → no hint, Google → alternates). Previously runtime
+    // changes coerced 'auto' to en-US while startup did not, so the same setting
+    // behaved differently depending on when it was applied.
+    this.googleSTT_User?.setRecognitionLanguage(key);
+    // Interviewer follows the main language unless it has its own override.
+    this.googleSTT?.setRecognitionLanguage(creds.getSttLanguageInterviewer());
+    this.processingHelper.getLLMHelper().setSttLanguage(key);
+  }
 
-    this.googleSTT?.setRecognitionLanguage(effectiveKey);
-    this.googleSTT_User?.setRecognitionLanguage(effectiveKey);
-    this.processingHelper.getLLMHelper().setSttLanguage(effectiveKey);
+  /** Set (or clear with '') the interviewer/system-audio recognition language. */
+  public setInterviewerRecognitionLanguage(key: string): void {
+    console.log(`[AppState] Setting interviewer recognition language to: ${key || '(same as main)'}`);
+    const { CredentialsManager } = require('./services/CredentialsManager');
+    const creds = CredentialsManager.getInstance();
+    creds.setSttLanguageInterviewer(key);
+    this.googleSTT?.setRecognitionLanguage(creds.getSttLanguageInterviewer());
   }
 
   public static getInstance(): AppState {
